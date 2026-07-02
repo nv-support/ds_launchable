@@ -98,7 +98,9 @@ Review these groups before running:
   into the container at `/workspace`. Keep the output root under the Jupyter root if you want to
   browse generated files from the left-hand file browser.
 - **Runtime:** `DEEPSTREAM_IMAGE`, `AGENT_CONTAINER`, and `AGENT_HOME` identify the stock
-  DeepStream environment in which the agent and generated application will run.
+  DeepStream environment in which the agent and generated application will run. `ANTHROPIC_MODEL`
+  selects the Claude agent model (default **Claude Opus 4.8** for best code quality; set
+  `claude-sonnet-4-6` for cheaper/faster, or empty to use Claude Code's own default).
 - **Scenario services:** Kafka, NATS, and VLM settings are consumed only when the selected prompt
   needs those services. The defaults target services started locally by this lab.
 - **Input and compatibility:** `SAMPLE_VIDEO` provides a known DeepStream sample, while
@@ -123,27 +125,40 @@ _C = {"head": "\\033[1;36m", "ok": "\\033[1;32m", "key": "\\033[0;36m", "off": "
 _repo = next((p for p in [pathlib.Path.cwd(), *pathlib.Path.cwd().parents]
               if (p / "deploy/brev/scripts/ds_agent_lab.py").exists()), pathlib.Path.cwd())
 
-os.environ.setdefault("REPO_ROOT", str(_repo))
-# Outputs default to a dir NEXT TO this notebook (deploy/brev/outputs) -- still under the Jupyter
-# root_dir, so they show in the left file browser. Override OUTPUT_ROOT to relocate.
-os.environ.setdefault("OUTPUT_ROOT", str(pathlib.Path(os.environ["REPO_ROOT"]) / "deploy" / "brev" / "outputs"))
-os.environ.setdefault("WORKSPACE", str(pathlib.Path(os.environ["OUTPUT_ROOT"]) / "workspace"))
-os.environ.setdefault("DEEPSTREAM_IMAGE", "nvcr.io/nvidia/deepstream:9.0-triton-multiarch")
-os.environ.setdefault("AGENT_CONTAINER", "ds-agent-work")
-os.environ.setdefault("AGENT_HOME", "/home/agent")
-os.environ.setdefault("KAFKA_TOPIC", "deepstream-agent-demo")
-os.environ.setdefault("KAFKA_BOOTSTRAP", "127.0.0.1:9092")
-os.environ.setdefault("NATS_URL", "nats://127.0.0.1:4222")
-os.environ.setdefault("NATS_SUBJECT", "deepstream.detections")
-os.environ.setdefault("VLM_ENDPOINT", "http://127.0.0.1:8000/v1")
-os.environ.setdefault("VLM_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
-os.environ.setdefault("SAMPLE_VIDEO", "/opt/nvidia/deepstream/deepstream/samples/streams/sample_720p.mp4")
-os.environ.setdefault("MIN_DRIVER_VERSION", "550.0.0")
+# All values below are assigned UNCONDITIONALLY (`os.environ[k] = v`, not `setdefault`): EDIT any of
+# them and re-run this cell to change it. `setdefault` would be a no-op on re-run, because os.environ
+# persists in the kernel and setdefault only writes when the key is absent. NOTE: for everything
+# except AGENT_TIMEOUT you must ALSO re-run the Install cell afterwards -- the lab module snapshots
+# these at import time; AGENT_TIMEOUT alone is re-read on the next Generate, so it takes effect at once.
+os.environ["REPO_ROOT"] = str(_repo)
+# Outputs live in a dir NEXT TO this notebook (deploy/brev/outputs) -- under the Jupyter root_dir, so
+# they show in the left file browser. Edit here to relocate.
+os.environ["OUTPUT_ROOT"] = str(pathlib.Path(os.environ["REPO_ROOT"]) / "deploy" / "brev" / "outputs")
+os.environ["WORKSPACE"] = str(pathlib.Path(os.environ["OUTPUT_ROOT"]) / "workspace")
+os.environ["DEEPSTREAM_IMAGE"] = "nvcr.io/nvidia/deepstream:9.0-triton-multiarch"
+os.environ["AGENT_CONTAINER"] = "ds-agent-work"
+os.environ["AGENT_HOME"] = "/home/agent"
+# Agent model for the 'claude' agent. Default = Claude Opus 4.8 (best code quality). Set to
+# "claude-sonnet-4-6" for cheaper/faster, or "" to let Claude Code pick its own default.
+# (Requires your account/key to have access to the chosen model. Codex uses its own default.)
+os.environ["ANTHROPIC_MODEL"] = "claude-opus-4-8"
+os.environ["KAFKA_TOPIC"] = "deepstream-agent-demo"
+os.environ["KAFKA_BOOTSTRAP"] = "127.0.0.1:9092"
+os.environ["NATS_URL"] = "nats://127.0.0.1:4222"
+os.environ["NATS_SUBJECT"] = "deepstream.detections"
+os.environ["VLM_ENDPOINT"] = "http://127.0.0.1:8000/v1"
+os.environ["VLM_MODEL"] = "Qwen/Qwen2.5-VL-3B-Instruct"
+os.environ["SAMPLE_VIDEO"] = "/opt/nvidia/deepstream/deepstream/samples/streams/sample_720p.mp4"
+os.environ["MIN_DRIVER_VERSION"] = "550.0.0"
+# Overall BACKSTOP (seconds) on one Generate run -- how long the agent may write + debug before it is
+# killed. 3000 = 50 min (heavy prompts like profiling can legitimately need this). Does NOT affect
+# demo runtime or MP4 length: live/RTSP runs are bounded separately at the Run step.
+os.environ["AGENT_TIMEOUT"] = "3000"
 
 print(f"{_C['head']}=== Global configuration ==={_C['off']}")
 for key in [
     "REPO_ROOT", "OUTPUT_ROOT", "WORKSPACE", "DEEPSTREAM_IMAGE",
-    "AGENT_CONTAINER", "AGENT_HOME", "MIN_DRIVER_VERSION",
+    "AGENT_CONTAINER", "AGENT_HOME", "ANTHROPIC_MODEL", "AGENT_TIMEOUT", "MIN_DRIVER_VERSION",
 ]:
     print(f"  {_C['key']}{key}{_C['off']}={os.environ[key]}")
 print(f"{_C['ok']}\\u2705 Configuration set -- continue to Step 2 (Check Environment & Create a DeepStream container workspace).{_C['off']}")
@@ -218,12 +233,6 @@ docker ps >/dev/null 2>&1 \\
 ok "Docker daemon: OK"
 echo ""
 
-section "NVIDIA Container Toolkit"
-docker run --rm --gpus all $DEEPSTREAM_IMAGE nvidia-smi >/dev/null 2>&1 \\
-    || fail "NVIDIA Container Toolkit is not functional. Install or repair it: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
-ok "NVIDIA Container Toolkit: OK"
-echo ""
-
 section "Disk Space"
 df -h / | tail -1 | awk '{print "Root:", $4, "available of", $2}'
 ok "Prerequisites check passed."
@@ -249,6 +258,13 @@ if ! docker image inspect "$DEEPSTREAM_IMAGE" >/dev/null 2>&1; then
 else
     ok "DeepStream image present: $DEEPSTREAM_IMAGE"
 fi
+
+# Validate the NVIDIA Container Toolkit only after the image is present, so a missing
+# image or NVCR credential failure is not misreported as a toolkit failure.
+section "NVIDIA Container Toolkit"
+docker run --rm --gpus all "$DEEPSTREAM_IMAGE" nvidia-smi >/dev/null 2>&1 \\
+    || fail "NVIDIA Container Toolkit is not functional. Install or repair it: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
+ok "NVIDIA Container Toolkit: OK"
 
 mkdir -p "$WORKSPACE/agent_outputs"
 rm -rf "$WORKSPACE/example_prompts"
@@ -468,24 +484,30 @@ and result rendering in Step 6.
 
 | Prompt | Typical usage | Expected result | Generate | Run & validate |
 | --- | --- | --- | ---: | ---: |
-| `import_vision_model_detection_pipeline` | Onboard an object-detection model end to end: convert it, build a TensorRT engine, benchmark it, and document the result | Model files, DeepStream configs, benchmark evidence, and a PDF report | ~45–90 min | ~1–3 min |
-| `ds_profiling_efficient_pipeline` | Measure a multi-stream pipeline, identify its bottleneck, and estimate the sustainable stream count | Nsight-based profiling report and an optimized pipeline project | ~10–20 min | ~15–30 min |
-| `msgbroker_nats` | Publish DeepStream object metadata through a NATS/JetStream message adapter | Runnable publisher plus captured NATS JSON messages | ~10–20 min | ~5–10 min |
-| `msgconv_kafka` | Convert DeepStream metadata and publish it to a Kafka topic | Runnable pipeline plus captured Kafka JSON messages | ~10–20 min | ~5–10 min |
-| `multi_stream_tracker` | Combine four RTSP sources with inference, tracking, and a tiled display | Annotated tiled MP4 with persistent track IDs | ~10–20 min | ~5–10 min |
-| `nvdsanalytics_config_sample` | Demonstrate ROI filtering, line crossing, overcrowding, and direction rules | Annotated MP4 showing `nvdsanalytics` results | ~10–15 min | ~5–10 min |
-| `nvdsdynamicsrcbin_app` | Exercise dynamic source addition and removal in a running DeepStream pipeline | Runnable dynamic-source app and lifecycle logs | ~10–15 min | ~3–8 min |
-| `rtvi_vlm_core_app & rtvi_vlm_openapi_spec` | Build the RTVI VLM pipeline, then add a FastAPI service around it in a second generation stage | VLM summaries, Kafka output, service code, OpenAPI spec, and API response | ~25–40 min | ~15–30 min |
-| `single_view_3d_tracker` | Track objects in 3D from a single camera and render the tracked result | Annotated MP4 from the single-view 3D tracker | ~10–20 min | ~5–15 min |
-| `video_infer_app` | Start with a compact file-based TrafficCamNet inference and OSD example | Runnable starter project and annotated MP4 | ~5–15 min | ~3–8 min |
-| `video_object_count` | Count detected objects in a video and present the counts with the stream | Object-count application and annotated MP4 | ~5–15 min | ~3–8 min |
-| `video_parallel_infer_app` | Run parallel inference branches and merge their metadata into one output | Multi-model pipeline and annotated merged MP4 | ~15–20 min | ~10–20 min |
-| `yolov26s_detection` | Convert YOLO26s for DeepStream and build a complete detection application | Converted model, DeepStream project, and annotated MP4 | ~15–20 min | ~10–20 min |
+| `import_vision_model_detection_pipeline` | Onboard an object-detection model end to end: convert it, build a TensorRT engine, benchmark it, and document the result | Model files, DeepStream configs, benchmark evidence, and a PDF report | ~15–30 min | ~1–2 min |
+| `ds_profiling_efficient_pipeline` | Measure a multi-stream pipeline, identify its bottleneck, and estimate the sustainable stream count | Nsight-based profiling report and an optimized pipeline project | ~7–12 min | ~12–20 min |
+| `msgbroker_nats` | Publish DeepStream object metadata through a NATS/JetStream message adapter | Runnable publisher plus captured NATS JSON messages | ~10–15 min | ~7–12 min |
+| `msgconv_kafka` | Convert DeepStream metadata and publish it to a Kafka topic | Runnable pipeline plus captured Kafka JSON messages | ~3–6 min | ~5–10 min |
+| `multi_stream_tracker` | Combine four RTSP sources with inference, tracking, and a tiled display | Annotated tiled MP4 with persistent track IDs | ~3–6 min | ~15–25 min |
+| `nvdsanalytics_config_sample` | Demonstrate ROI filtering, line crossing, overcrowding, and direction rules | Annotated MP4 showing `nvdsanalytics` results | ~5–10 min | ~4–8 min |
+| `nvdsdynamicsrcbin_app` | Exercise dynamic source addition and removal in a running DeepStream pipeline | Runnable dynamic-source app and lifecycle logs | ~3–6 min | ~4–8 min |
+| `rtvi_vlm_core_app & rtvi_vlm_openapi_spec` | Build the RTVI VLM pipeline, then add a FastAPI service around it in a second generation stage | VLM summaries, Kafka output, service code, OpenAPI spec, and API response | ~15–25 min | ~8–15 min |
+| `single_view_3d_tracker` | Track objects in 3D from a single camera and render the tracked result | Annotated MP4 from the single-view 3D tracker | ~7–12 min | ~8–15 min |
+| `video_infer_app` | Start with a compact file-based TrafficCamNet inference and OSD example | Runnable starter project and annotated MP4 | ~2–5 min | ~3–6 min |
+| `video_object_count` | Count detected objects in a video and present the counts with the stream | Object-count application and annotated MP4 | ~2–5 min | ~3–6 min |
+| `video_parallel_infer_app` | Run parallel inference branches and merge their metadata into one output | Multi-model pipeline and annotated merged MP4 | ~12–20 min | ~20–30 min |
+| `yolov26s_detection` | Convert YOLO26s for DeepStream and build a complete detection application | Converted model, DeepStream project, and annotated MP4 | ~5–10 min | ~8–15 min |
 
-> **Timing notes:** estimates assume the DeepStream image, Python packages, model files, and
-> TensorRT engines are already cached. A first run can add ~10–60+ minutes for image pulls, model
-> downloads, VLM startup, or engine builds. Actual time also varies with GPU performance, network
-> bandwidth, model-provider latency, prompt edits, and how many repair attempts are needed.
+> **Timing notes:** the ranges are coarse, derived from a measured warm run (DeepStream image,
+> Python packages, model files, and TensorRT engines already cached). A first/cold run adds time
+> for image pulls, model downloads, VLM startup, or engine builds — e.g. `import_vision` does its
+> engine build + benchmark at **Generate** (cached ~15 min; a cold first-ever TensorRT engine build
+> can add significant time on top).
+> **Run & validate** time is dominated by how many run-and-repair iterations the agent needs, so
+> the harder scenarios (live multi-stream RTSP, multi-model parallel) sit at the high end and vary
+> the most. Actual time also depends on GPU performance, network bandwidth, and prompt edits.
+
+<sub>Measured with Claude Code's default agent model **`claude-sonnet-4-6`** (no `ANTHROPIC_MODEL` override) and default thinking mode (no override set).</sub>
 
 A productive prompt states the desired **input**, **processing or model**, **output**,
 **integration constraints**, and **evidence of success**. Be explicit about details that matter

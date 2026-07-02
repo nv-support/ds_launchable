@@ -346,10 +346,6 @@ def load_prompt_text(item):
     return text
 
 
-PROMPT_CATALOG = [
-    item for item in PROMPT_CATALOG if (REPO_ROOT / item["file"]).is_file()
-]
-
 for item in PROMPT_CATALOG:
     item["prompt"] = load_prompt_text(item)
 
@@ -365,17 +361,6 @@ PROMPT_SEQUENCES = {
         "rtvi_vlm_core_app",
         "rtvi_vlm_openapi_spec",
     ],
-}
-_available_prompt_ids = set(PROMPT_IDS)
-PROMPT_SEQUENCES = {
-    label: available_members
-    for label, members in PROMPT_SEQUENCES.items()
-    if len(
-        available_members := [
-            member for member in members if member in _available_prompt_ids
-        ]
-    )
-    > 1
 }
 
 # Dropdown ids = catalog ids with each sequence's members collapsed into their combined label

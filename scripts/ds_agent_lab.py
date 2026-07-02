@@ -238,6 +238,12 @@ def dexec(inner, **kw):
     return subprocess.run(cmd, text=True, **kw)
 
 
+# Diagnostics from the most recent streamed run (stream_cmd / _stream_agent_json). run_agent reads
+# this right after its call to explain WHY a non-zero rc happened: did OUR watchdog fire (timeout),
+# or was the process killed/exited by something else (external SIGKILL / host OOM / self-exit)?
+_LAST_AGENT_RUN = {}
+
+
 def stream_cmd(cmd, env=None, timeout=None):
     """Run a host command, STREAMING stdout line-by-line through print() so it shows live in
     the notebook Output widget (raw subprocess fd output otherwise bypasses ipywidgets).
@@ -246,6 +252,7 @@ def stream_cmd(cmd, env=None, timeout=None):
     the child is killed too, so a user can cleanly abandon a slow step (e.g. a multi-GB VLM
     weight download) instead of reloading the page and leaking the run. Returns the exit code."""
     import threading
+    import time
 
     proc = subprocess.Popen(
         cmd,
@@ -255,7 +262,18 @@ def stream_cmd(cmd, env=None, timeout=None):
         text=True,
         bufsize=1,
     )
-    timer = threading.Timer(timeout, proc.kill) if timeout else None
+    fired = {"v": False}  # did OUR watchdog fire?
+
+    def _on_timeout():
+        fired["v"] = True
+        print(
+            f"\n[watchdog] command exceeded the {timeout}s budget -- sending SIGKILL now.",
+            flush=True,
+        )
+        proc.kill()
+
+    timer = threading.Timer(timeout, _on_timeout) if timeout else None
+    start = time.monotonic()
     if timer:
         timer.start()
     try:
@@ -271,6 +289,10 @@ def stream_cmd(cmd, env=None, timeout=None):
         if timer:
             timer.cancel()
         proc.wait()
+    _LAST_AGENT_RUN.clear()
+    _LAST_AGENT_RUN.update(
+        timed_out=fired["v"], elapsed=round(time.monotonic() - start), timeout=timeout
+    )
     return proc.returncode
 
 
@@ -364,6 +386,16 @@ RUN_CONTRACT = """## How this headless launchable runs the app
   setup (create a venv / install deps / download or export the model / build the TensorRT engine),
   then run the pipeline non-interactively, writing outputs to the artifacts dir below. It MUST
   honor `DEMO_INPUT` (a video path or RTSP URL source) and `DEMO_SECONDS` (a runtime cap) when set.
+- Iterate FAST: while debugging, validate with a SHORT run (a few seconds -- just enough to confirm
+  frames flow and the pipeline does not crash), NOT a full-length run; do ONE final full
+  `DEMO_SECONDS` run only once it works. This keeps the run-and-fix loop quick.
+- Cache the TensorRT engine: build it ONCE and REUSE it (`trtexec --saveEngine=...`, or set nvinfer's
+  `model-engine-file` so it skips the rebuild when the `.engine` already exists). The engine build is
+  the slowest step -- never rebuild it on every run/iteration.
+- Keep the artifacts dir CLEAN: write ONLY the final deliverable (e.g. a single `out.mp4`) into the
+  artifacts dir below. Put any scratch / test / full-length trial outputs under `/tmp` (or delete
+  them) -- do NOT leave extra files like `out_test.mp4` beside the real output, or the result viewer
+  picks them up too.
 - Finish cleanly so files are valid: send EOS and WAIT for it to reach the sink before quitting so
   `nvvideoencfilesinkbin` finalizes the file (else a 0-byte mp4). FILE source -> run to natural EOS (the
   first run may spend 30-90s building the engine; do not cap that). RTSP/live -> after frames flow,
@@ -388,10 +420,15 @@ def _service_endpoints_ctx():
     if _use_rtsp():
         urls = ", ".join(rtsp_urls or [f"{RTSP_BASE}/cam0"])
         lines.append(
-            f"- RTSP: an EMPTY mediamtx server is up at {urls} (no publisher yet). In `run_demo.sh`, "
-            f"push the sample video ONCE per path right before reading it -- e.g. "
-            f"`ffmpeg -re -i {SAMPLE_VIDEO} -c copy -rtsp_transport tcp -f rtsp <URL> &` -- so the "
-            "stream is live when the pipeline connects and then ENDS, giving a clean EOS (no looping)."
+            f"- RTSP: an EMPTY mediamtx server is up at {urls} (no publisher yet). Use this PROVEN "
+            "order in `run_demo.sh` to avoid the connect-timing flakiness that otherwise needs many "
+            f"retries: (1) start one background `ffmpeg` publisher PER path FIRST -- "
+            f"`ffmpeg -re -i {SAMPLE_VIDEO} -c copy -rtsp_transport tcp -f rtsp <URL> &` -- (2) sleep "
+            "~2-3s so the streams are live, (3) THEN launch the pipeline, reading each URL with "
+            "`nvurisrcbin` over TCP with its rtsp-reconnect knobs enabled (see the `deepstream-dev` "
+            "skill for the exact property names) and `async=0` on sinks. Each publisher pushes the "
+            "file ONCE so the stream ENDS -> clean EOS (no looping). Reuse the running publishers "
+            "across code edits; do NOT restart them every iteration."
         )
     if selected["needs_kafka"]:
         lines.append(f"- Kafka: bootstrap `{KAFKA_BOOTSTRAP}`, topic `{KAFKA_TOPIC}`.")
@@ -472,7 +509,9 @@ def build_run_prompt(app_dir=None):
         "service_code": "the FastAPI microservice answering on `/openapi.json`",
         "logs": "the demo's stdout / FPS / buffer-count output",
         "profile_report": (
-            "a profiling report PRINTED to stdout (so it is captured in the run log): the "
+            f"a profiling report SAVED to a file `{ctr_run_out}/profiling_report.txt` (so it "
+            "persists on disk and can be displayed -- do NOT only print it to stdout, which is "
+            "lost when the run log is filtered out). Also echo it to stdout. It must state the "
             "bottleneck (decode / compute / memory-bandwidth), the max streams this GPU sustains "
             "at 30 FPS, and which HW upgrade helps -- plus the measured per-stream FPS"
         ),
@@ -525,9 +564,50 @@ def build_run_prompt(app_dir=None):
     return f"{ctr_run_out}/run_prompt.md"
 
 
+def _container_workspace_host():
+    """Host directory the running AGENT_CONTAINER maps at /workspace, or None if not running."""
+    try:
+        r = subprocess.run(
+            ["docker", "inspect", AGENT_CONTAINER, "--format",
+             '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}'],
+            text=True, capture_output=True,
+        )
+    except OSError:
+        return None
+    src = (r.stdout or "").strip()
+    return src or None
+
+
+def sync_workspace_to_container():
+    """Make the kernel's WORKSPACE/OUTPUT_ROOT match the host path the EXISTING working container
+    actually mounts at /workspace.
+
+    Why: the container is created in Step 2 (with whatever OUTPUT_ROOT was set then) and may be REUSED
+    across kernel restarts / later rounds. If the OUTPUT_ROOT default later differs (e.g. a config
+    change), the agent would write into the container's mount while the kernel reads a different dir
+    -> 'results not found'. The container is where work actually lands, so we treat ITS mount as the
+    source of truth. No-op when no container exists (Step 2 will then create it at the current path).
+    Rebinds ds_agent_lab's own WORKSPACE/OUTPUT_ROOT globals (a `global` here rebinds this module's
+    copy, which every lab.* function uses)."""
+    global WORKSPACE, OUTPUT_ROOT
+    host = _container_workspace_host()
+    if not host:
+        return
+    host = Path(host).resolve()
+    if host != WORKSPACE:
+        klog(
+            f"Reusing container '{AGENT_CONTAINER}': syncing workspace to its actual mount "
+            f"{host} (kernel had {WORKSPACE}). Re-run Step 2 to relocate.",
+            "warn",
+        )
+        WORKSPACE = host
+        OUTPUT_ROOT = host.parent
+
+
 def prepare_services():
     """Start ONLY the RTSP/Kafka/VLM services the selected prompt needs (invisible/auto)."""
     global rtsp_urls
+    sync_workspace_to_container()  # reuse-safe: read/write where the (reused) container maps /workspace
     # --- RTSP ---
     rtsp_urls = []
     if (
@@ -780,11 +860,24 @@ def _print_agent_event(ev):
 def _stream_agent_json(cmd, timeout):
     """Popen the claude stream-json exec, print events live (watchdog timeout, interrupt-safe)."""
     import threading
+    import time
 
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
     )
-    timer = threading.Timer(timeout, proc.kill)
+    fired = {"v": False}  # did OUR watchdog fire?
+
+    def _on_timeout():
+        fired["v"] = True
+        print(
+            f"\n[watchdog] agent exceeded the {timeout}s budget -- sending SIGKILL to the "
+            "`docker exec` client now.",
+            flush=True,
+        )
+        proc.kill()
+
+    timer = threading.Timer(timeout, _on_timeout)
+    start = time.monotonic()
     timer.start()
     try:
         for line in proc.stdout:
@@ -802,6 +895,10 @@ def _stream_agent_json(cmd, timeout):
     finally:
         timer.cancel()
         proc.wait()
+    _LAST_AGENT_RUN.clear()
+    _LAST_AGENT_RUN.update(
+        timed_out=fired["v"], elapsed=round(time.monotonic() - start), timeout=timeout
+    )
     return proc.returncode
 
 
@@ -813,8 +910,9 @@ def run_agent(prompt_path=None, log_name="agent_run.log", timeout=None, workdir=
             build_agent_prompt()
         prompt_path = ctr_prompt_path
     timeout = timeout or int(
-        os.environ.get("AGENT_TIMEOUT", "1200")
-    )  # 20 min backstop, not 1h
+        os.environ.get("AGENT_TIMEOUT", "3000")
+    )  # 50 min: a generous BACKSTOP on the whole Generate session (settable in Step 1). Live/RTSP
+    # runtime is bounded separately at the Run step (DEMO_SECONDS + RUN_DEMO_TIMEOUT), not here.
     ctr_log = f"{ctr_run_out}/{log_name}"
     # `set -o pipefail` so the agent's real exit status is not masked by `| tee`.
     if AGENT == "claude":
@@ -852,9 +950,27 @@ def run_agent(prompt_path=None, log_name="agent_run.log", timeout=None, workdir=
         )
         rc = dexec_stream(inner, timeout)
     if rc not in (0, None):
+        # Classify WHY it stopped so a non-zero rc is diagnosable instead of guessed. rc=-9 alone is
+        # ambiguous (our watchdog vs an external SIGKILL/OOM); the watchdog flag disambiguates.
+        diag = dict(_LAST_AGENT_RUN)
+        elapsed = diag.get("elapsed")
+        if diag.get("timed_out"):
+            cause = f"OUR {timeout}s watchdog fired and SIGKILLed the docker exec client (timeout)"
+        elif rc == -9:
+            cause = (
+                "SIGKILL (-9) but our watchdog did NOT fire -- an EXTERNAL kill "
+                "(host OOM-killer, or something/someone else). Check `dmesg | grep -i oom`"
+            )
+        elif rc < 0:
+            cause = f"killed by signal {-rc} (not our watchdog)"
+        else:
+            cause = f"the agent process exited on its own with code {rc}"
         print(
-            f"\nWARNING: {AGENT} exited non-zero (returncode={rc}); see the log above. Continuing best-effort."
+            f"\nWARNING: {AGENT} did not finish cleanly (returncode={rc}"
+            + (f", ran ~{elapsed}s of the {timeout}s budget" if elapsed is not None else "")
+            + f"): {cause}. See the log above. Continuing best-effort."
         )
+    return rc
 
 
 def _find_run_demo():
@@ -979,7 +1095,7 @@ def show_generated_code(max_files=6, max_lines=400, show_code=True, exclude_larg
             f"No generated code found yet (looked in {candidates[0]} and the run dir). "
             "Re-run Generate or check the log above."
         )
-        return
+        return False
     print(f"Generated code for '{SELECTED_PROMPT_ID}' under {app_dir_host}")
     try:  # outputs live under the Jupyter root_dir -> point to them in the left file browser
         print(f"\U0001f4c2 Open in the left file browser: {app_dir_host.relative_to(REPO_ROOT)}/")
@@ -1026,7 +1142,7 @@ def show_generated_code(max_files=6, max_lines=400, show_code=True, exclude_larg
         print(f"Download zip: {zip_path}")
 
     if not show_code:  # download-only: no inline content dump (report+config prompts)
-        return
+        return True
 
     pys = [p for p in all_files if p.suffix == ".py"]
     shells = [p for p in all_files if p.name in ("run_demo.sh", "run_service.sh")]
@@ -1084,6 +1200,7 @@ def show_generated_code(max_files=6, max_lines=400, show_code=True, exclude_larg
                 f"{_highlight_html(code, p.name)}</details>"
             )
         )
+    return True
 
 
 _CUR_OUT = None  # the active step's Output widget (set by run_step_threaded's worker)
@@ -1208,9 +1325,11 @@ def run_demo():
         )
 
 
-def consume_kafka(max_show=5):
+def consume_kafka(max_show=5, quiet=False):
     """Consume recent Kafka messages and show them PRETTY: each JSON message formatted (indent=2)
-    and syntax-highlighted, instead of one raw line per message."""
+    and syntax-highlighted, instead of one raw line per message. `quiet=True` suppresses the
+    "no messages" line -- used where Kafka is an OPTIONAL secondary section (service_code), so an
+    empty topic isn't reported as if it were a failure."""
     if not selected["needs_kafka"]:
         return
     from IPython.display import HTML
@@ -1249,9 +1368,10 @@ def consume_kafka(max_show=5):
                 break
             i = nl + 1
     if not msgs:
-        print(f"No Kafka messages on topic '{KAFKA_TOPIC}' within 15s.")
-        if result.stderr.strip():
-            print(result.stderr.strip().splitlines()[-1])
+        if not quiet:
+            print(f"No Kafka messages on topic '{KAFKA_TOPIC}' within 15s.")
+            if result.stderr.strip():
+                print(result.stderr.strip().splitlines()[-1])
         return
     print(f"{len(msgs)} message(s) on topic '{KAFKA_TOPIC}'. Showing the first "
           f"{min(max_show, len(msgs))}, formatted:")
@@ -1373,10 +1493,29 @@ def curl_microservice():
     _show_paths(dexec(f"curl -fsS {base}/openapi.json", capture_output=True).stdout, "live")
 
 
+def _serve_file(src):
+    """Return a Jupyter `/files/` URL for `src` so the browser STREAMS it (fast, no base64 bloat).
+    Direct when `src` is under REPO_ROOT (the server root_dir); otherwise copy it under
+    REPO_ROOT/deploy/brev/_downloads and serve that. None on failure (caller falls back to embed)."""
+    try:
+        p = Path(src).resolve()
+        try:
+            return "/files/" + str(p.relative_to(REPO_ROOT))
+        except ValueError:  # outside the Jupyter root_dir -> copy under it, then serve
+            dst_dir = REPO_ROOT / "deploy/brev/_downloads" / SELECTED_PROMPT_ID
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            dst = dst_dir / p.name
+            shutil.copy2(p, dst)
+            return "/files/" + str(dst.relative_to(REPO_ROOT))
+    except (OSError, ValueError):
+        return None
+
+
 def show_results():
     """Scenario-branched artifact display + a full fallback listing."""
     from IPython.display import display, Video, HTML, FileLink
 
+    sync_workspace_to_container()  # reuse-safe: read where the (reused) container maps /workspace
     search_roots = [
         WORKSPACE / "agent_outputs" / SELECTED_PROMPT_ID,
         WORKSPACE / selected["output_dir"],
@@ -1408,17 +1547,38 @@ def show_results():
     except ValueError:
         pass
     if artifact == "mp4":
-        mp4s = _collect(("*.mp4",))
-        if mp4s:
-            for mp4 in mp4s[:2]:
-                print(f"Playing: {mp4}")
-                emit_display(
-                    Video(str(mp4), embed=True, html_attributes="controls width=900")
-                )
+        # Scope to THIS prompt's OWN output dirs -- NOT the shared models/ cache, which holds other
+        # prompts' artifacts (e.g. import_vision's rtdetr sample videos) and would otherwise be shown
+        # as this prompt's result. Skip 0-byte / failed files (a stray empty out.mp4 from an
+        # unfinalized sink must never win over the real video). Prefer the canonical out.mp4 (the run
+        # contract names it); else the LARGEST remaining real output. Show ONE, streamed via a /files
+        # URL not base64 (fast, no notebook bloat; a 96 MB embed = ~130 MB of base64 in the .ipynb).
+        own = (
+            str(WORKSPACE / "agent_outputs" / SELECTED_PROMPT_ID),
+            str(WORKSPACE / selected["output_dir"]),
+        )
+        mp4s = [
+            m
+            for m in _collect(("*.mp4",))
+            if m.exists() and m.stat().st_size > 0 and str(m).startswith(own)
+        ]
+        pick = next((m for m in mp4s if m.name == "out.mp4"), None)
+        if pick is None and mp4s:
+            pick = max(mp4s, key=lambda p: p.stat().st_size)
+        if pick:
+            print(f"Playing: {pick}")
+            url = _serve_file(pick)
+            if url:
+                emit_display(HTML(f'<video controls width="900" src="{url}"></video>'))
+            else:  # outside root_dir and copy failed -- fall back to base64 embed
+                emit_display(Video(str(pick), embed=True, html_attributes="controls width=900"))
+            extra = [m for m in mp4s if m != pick]
+            if extra:
+                print(f"({len(extra)} other .mp4 not shown: {', '.join(m.name for m in extra)})")
         else:
             print(
-                "No MP4 found yet. The generated app must write out.mp4 via encoder + filesink "
-                "(headless, no EGL). Re-run the Run step."
+                "No non-empty MP4 found yet (a 0-byte file means the encoder never finalized -- "
+                "ensure EOS reaches nvvideoencfilesinkbin before exit). Re-run the Run step."
             )
     elif artifact == "pdf_report":
         from IPython.display import Markdown, Image, HTML
@@ -1476,34 +1636,64 @@ def show_results():
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
-        # Fallback (no PDF, or rasterize failed): report text + charts as inline images.
+        # Fallback (no PDF, or rasterize failed): the benchmark report markdown + charts. The report
+        # is reports/benchmark_report.{md,html} -- NOT README.md, which is setup instructions and must
+        # never be shown as "the report".
         if not shown:
             mds = _collect(("*.md",))
-            reports = (
-                [m for m in mds if "report" in m.name.lower()]
-                or [m for m in mds if m.name.lower() != "readme.md"]
-                or mds
-            )
+            reports = [
+                m
+                for m in mds
+                if m.name.lower() != "readme.md"
+                and any(k in m.name.lower() for k in ("report", "benchmark", "summary"))
+            ]
             if reports:
                 txt = reports[0].read_text(errors="replace")
                 txt = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", txt)
                 txt = re.sub(r"<img[^>]*>", "", txt)
                 print(f"Report ({reports[0].name}):")
                 emit_display(Markdown(txt))
+                shown = True
+            # The styled HTML report can't render inline (JupyterLab sanitizes <iframe>/<embed>) --
+            # offer it as a download instead.
+            for h in _collect(("*.html",)):
+                if any(k in h.name.lower() for k in ("report", "benchmark")):
+                    u = _serve(h, download=True)
+                    if u:
+                        emit_display(
+                            HTML(f'<b>HTML report:</b> <a href="{u}" download>{h.name}</a> (download)')
+                        )
+                        shown = True
+                    break
+            # Charts: PNGs in a charts/ dir, or named chart*/benchmark*.
             charts, seen = [], set()
-            for c in sorted(_collect(("*.png",))):
-                if "chart" in c.name.lower() and c.name not in seen:
+            for c in _collect(("*.png",)):
+                low = [p.lower() for p in c.parts]
+                if c.name not in seen and (
+                    "chart" in c.name.lower() or "benchmark" in c.name.lower() or "charts" in low
+                ):
                     seen.add(c.name)
                     charts.append(c)
             if charts:
                 print(f"\nCharts ({len(charts)}):")
                 for c in charts:
                     emit_display(Image(filename=str(c)))
+                shown = True
 
-        if not pdf and not _collect(("*.md",)):
+        # Nothing report-like found -- say so clearly and do NOT pass README.md off as the report.
+        # The skill writes reports/benchmark_report.{md,html,pdf} + reports/charts/ only after the
+        # engine build + benchmark finish; an interrupted/timed-out Generate leaves none of them.
+        if not shown and not pdf:
             print(
-                "No report found yet. The import-vision-model skill writes it under models/<name>/reports/."
+                "No benchmark report found. Expected models/<name>/reports/"
+                "benchmark_report.{md,html,pdf} + reports/charts/. The import-vision pipeline did not "
+                "finish its report stage (often the TensorRT engine build was still running) -- re-run "
+                "and let Generate run to completion."
             )
+            readmes = [m for m in _collect(("*.md",)) if m.name.lower() == "readme.md"]
+            if readmes:
+                print(f"\nSetup instructions ({readmes[0].name}) -- NOT the benchmark report:")
+                emit_display(Markdown(readmes[0].read_text(errors="replace")))
     elif artifact in ("kafka_json", "kafka_text"):
         kind = "JSON detection" if artifact == "kafka_json" else "VLM text summary"
         print(f"This scenario streams {kind} messages to Kafka topic '{KAFKA_TOPIC}'.")
@@ -1562,7 +1752,8 @@ def show_results():
                     shown += 1
                     if shown >= 3:
                         break
-        consume_kafka()  # also show any VLM summaries the app published to Kafka
+        consume_kafka(quiet=True)  # secondary: show Kafka VLM summaries IF any (this variant may
+        # serve captions only via the API and not publish to Kafka -- don't report empty as a failure)
         if not shown:
             print("(no saved VLM summary JSON found under the run-out dir yet)")
         print("\n--- microservice API (openapi spec) ---")
@@ -1574,35 +1765,37 @@ def show_results():
                 for f in sorted(svc_root.rglob(pat))[:20]:
                     print(f"  {f}")
     elif artifact == "profile_report":
-        # Rule: the deliverable is the Nsight-derived PROFILING REPORT -- bottleneck
-        # (decode/compute/memory), max streams sustainable at 30 FPS, and the HW-upgrade
-        # recommendation. The deepstream-profile-pipeline skill prints this as a Markdown
-        # "## Profile summary" to stdout, which the run tees into run_demo.log; the agent may
-        # also save a report .md. Show the report (md preferred), then the run-log summary, then
-        # link any nsys captures.
-        from IPython.display import Markdown
+        # FIXED deliverable (same discipline as out.mp4 for video): the Run prompt (build_run_prompt)
+        # tells the agent to SAVE the report to exactly `<run_out>/profiling_report.txt`. Read THAT
+        # file -- no keyword globbing, no log tailing. If it's missing, the Run didn't finish the
+        # job; say so and let the user re-run Run (the prompt pins the target output).
+        import html as _html
 
-        mds = _collect(("*.md",))
-        reports = [
-            m for m in mds if any(k in m.name.lower() for k in ("report", "profile", "benchmark"))
-        ] or [m for m in mds if m.name.lower() != "readme.md"]
-        if reports:
-            print(f"Profiling report ({reports[0].name}):")
-            emit_display(Markdown(reports[0].read_text(errors="replace")))
-        logs = _collect(("*.log",))
-        if logs:
-            print("\nProfile run log (per-stream FPS / bottleneck / Nsight summary) -- tail:")
-            print("\n".join(logs[0].read_text(errors="replace").splitlines()[-60:]))
+        from IPython.display import HTML
+
+        run_out = WORKSPACE / "agent_outputs" / SELECTED_PROMPT_ID
+        report = run_out / "profiling_report.txt"
+        if report.exists():
+            print(f"Profiling report ({report.name}):")
+            # Fixed-width plain text (aligned columns, single-\n line breaks): render verbatim in a
+            # <pre> so the layout is preserved (Markdown would collapse the newlines and spaces).
+            emit_display(
+                HTML(
+                    "<pre style='white-space:pre;overflow-x:auto;font-family:monospace;"
+                    f"font-size:12px;line-height:1.3'>{_html.escape(report.read_text(errors='replace'))}</pre>"
+                )
+            )
+        else:
+            print(
+                f"No profiling report at {report}. The Run step's job is to fix the app until it "
+                "writes that file -- re-run Run."
+            )
+        # Supplementary (not the deliverable): the Nsight capture, for the GUI trace.
         nsys = _collect(("*.nsys-rep",))
         if nsys:
             print("\nNsight Systems captures (open in the Nsight Systems GUI for the full trace):")
             for r in nsys[:3]:
                 print(f"  {r}")
-        if not reports and not logs:
-            print(
-                "No profiling output yet -- re-run the Run step. The skill prints the bottleneck / "
-                "max-streams / upgrade summary to stdout (captured in run_demo.log)."
-            )
     elif artifact == "nats_json":
         print(
             f"This scenario publishes object-detection metadata to NATS subject '{NATS_SUBJECT}'."
@@ -1877,10 +2070,17 @@ def _generate_one():
                 f"Could not prepare an isolated Generate dir ({app_dir_ctr}): "
                 f"{(rc.stderr or '').strip()[-300:]}"
             )
-    run_agent(
+    timeout_used = selected.get("generate_timeout") or int(os.environ.get("AGENT_TIMEOUT", "3000"))
+    rc = run_agent(
         timeout=selected.get("generate_timeout"),  # import_vision needs a longer budget
         workdir="/workspace" if in_ws else app_dir_ctr,
     )
+    # Show whatever was produced, then judge success by the presence of the Generate DELIVERABLE.
+    # On failure RAISE (SystemExit) so the step banner shows FAILED and 'generated' stays unset (which
+    # gates the Run step) -- rather than letting the display below falsely imply success. The agent
+    # can end its turn early and leave an empty / half-done Generate: most often it defers with a
+    # scheduled wake-up, which makes `claude -p` exit 0 expecting an external re-invocation this
+    # headless harness never provides, so the remaining work never runs.
     # Per-prompt Generate-phase display rule. Default: dump the generated code inline. Prompts whose
     # output is a report + config files (not an app to read) set generate_display="download" -- we
     # still give the download (minus the huge model/engine binaries), but skip the inline dump; the
@@ -1892,9 +2092,44 @@ def _generate_one():
             "The report is rendered at the Run step; download link below."
         )
         show_generated_code(show_code=False, exclude_large_mb=25)
+        # Deliverable = the pipeline's FINAL product, a non-empty PDF report. Partial artifacts
+        # (engine, parser) can exist even when the benchmark/report stage never ran -> key off the PDF.
+        roots = {WORKSPACE / selected["output_dir"]}
+        if selected["needs_model_import"]:
+            roots.add(WORKSPACE / "models")
+        produced = any(
+            p.is_file() and p.stat().st_size > 0
+            for root in roots
+            if root.exists()
+            for p in root.rglob("*.pdf")
+        )
+        missing = "no non-empty PDF report was written under models/<name>/reports/"
     else:
+        # Normal prompts: Generate writes the app CODE (it is run + fixed later at the Run step).
         print("\n=== Generated code (your prompt -> code) ===")
-        show_generated_code()
+        produced = show_generated_code()  # True iff meaningful code files were written
+        missing = "no application code was written to the app directory"
+
+    # Success requires BOTH a clean agent exit AND the real deliverable. Checking the deliverable
+    # alone is not enough: on a watchdog timeout the agent is SIGKILLed (rc=-9) mid-run, yet partial
+    # artifacts it already wrote (e.g. the app .py) sit on disk -- a file-presence-only check would
+    # then falsely report success. A non-zero rc means the run did not finish; fail regardless.
+    killed = rc not in (0, None)
+    if killed or not produced:
+        if killed:
+            reason = f"the agent process did not exit cleanly (returncode={rc})" + (
+                f" -- it hit the {timeout_used}s Generate timeout; raise AGENT_TIMEOUT in Step 1 "
+                "and re-run" if rc == -9 else ""
+            )
+        else:
+            reason = (
+                f"{missing} -- the agent most likely ended its run early (e.g. deferred with a "
+                "scheduled wake-up, which this headless `claude -p` run cannot resume)"
+            )
+        raise SystemExit(
+            f"Generate did not complete for '{SELECTED_PROMPT_ID}': {reason}. Re-run Generate; "
+            "cached artifacts under the app dir are reused, so the retry is faster."
+        )
 
 
 def generate():
@@ -1906,6 +2141,7 @@ def generate():
     app first (fresh, isolated), then the microservice on top of it (generate_in_workspace) -- and
     leave the selection on the FINAL stage so Run + show_results target the finished software."""
     global selected, SELECTED_PROMPT_ID
+    sync_workspace_to_container()  # reuse-safe: write where the (reused) container maps /workspace
     if selected_sequence:
         seq = list(selected_sequence)
         for n, sub_id in enumerate(seq):

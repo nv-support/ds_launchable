@@ -44,8 +44,10 @@ MSG
   exit 0
 fi
 
-# Already healthy? Reuse it.
-if curl -fsS "${VLM_ENDPOINT}/models" >/dev/null 2>&1; then
+# Already healthy AND served by our own container? Reuse it. Guard against a different
+# service occupying the port so we don't falsely report "already serving".
+if docker ps --format '{{.Names}}' | grep -Fxq "${VLM_CONTAINER}" \
+  && curl -fsS "${VLM_ENDPOINT}/models" >/dev/null 2>&1; then
   echo "VLM already serving at ${VLM_ENDPOINT}"
   curl -fsS "${VLM_ENDPOINT}/models" || true
   echo

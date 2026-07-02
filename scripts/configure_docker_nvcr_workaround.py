@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -14,7 +16,7 @@ def main() -> int:
             ["docker", "version", "--format", "{{.Server.Version}}"],
             text=True,
         ).strip()
-    except Exception as exc:
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
         print(f"Docker is not available yet; skipping NVCR workaround: {exc}")
         return 0
 
@@ -35,9 +37,21 @@ def main() -> int:
         return 0
 
     features["containerd-snapshotter"] = False
-    tmp = Path("/tmp/docker-daemon-nvcr-workaround.json")
-    tmp.write_text(json.dumps(daemon, indent=2) + "\n")
-    subprocess.run(["sudo", "cp", str(tmp), str(daemon_path)], check=True)
+    # Write to a uniquely-named, 0600 temp file to avoid symlink/race attacks on a
+    # predictable /tmp path before the privileged copy below.
+    fd, tmp_path = tempfile.mkstemp(prefix="docker-daemon-nvcr-", suffix=".json", dir="/tmp")
+    try:
+        with os.fdopen(fd, "w") as fp:
+            fp.write(json.dumps(daemon, indent=2) + "\n")
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.chmod(tmp_path, 0o600)
+        subprocess.run(["sudo", "cp", tmp_path, str(daemon_path)], check=True)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
     subprocess.run(["sudo", "systemctl", "restart", "docker"], check=True)
     print(f"Docker {docker_version}: disabled containerd-snapshotter and restarted Docker.")
     return 0
