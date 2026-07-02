@@ -2,7 +2,7 @@
 
 Pure data/defaults: paths, container/image names, service endpoints, timeouts, credential
 defaults (overwritten at runtime by ds_agent_lab in the Install step), and the PROMPT_CATALOG (1:1 with
-example_prompts/*.md) plus its accessors. No logic lives here. ds_agent_lab does
+example_prompts/*.md) plus its accessors. ds_agent_lab does
 `from ds_lab_config import *`, so these names are part of the `lab.*` surface; runtime mutation
 happens on ds_agent_lab's own bindings (a `global X` there rebinds its copy, not this default).
 """
@@ -131,6 +131,9 @@ PROMPT_CATALOG = [
         "needs_pdf_report": True,
         "interactive": True,
         "preferred_artifact": "pdf_report",
+        # The requested deliverable is measured output, not just authored code. Generate must
+        # finish it in the current one-shot agent invocation.
+        "generate_result": "pdf_report",
         # End-to-end onboard: build engine + benchmark + report all happen at Generate.
         "generate_timeout": IMPORT_VISION_TIMEOUT,
         # Generate output is a report + config files (not an app) -> download only, no inline dump.
@@ -154,9 +157,12 @@ PROMPT_CATALOG = [
         "needs_model_import": False,
         "needs_pdf_report": False,
         "interactive": False,
-        # Deliverable is the Nsight-derived profiling report (bottleneck, max streams @30 FPS,
-        # HW upgrade), printed as Markdown to stdout by the skill -> shown from the run log.
+        # Deliverable is the saved Nsight-derived profiling report (bottleneck, max streams @30 FPS,
+        # HW upgrade); show_results renders the fixed report path after Generate.
         "preferred_artifact": "profile_report",
+        # Profiling conclusions must come from this GPU's real measurements, so the report is a
+        # Generate deliverable. The normal Run button only renders the completed report.
+        "generate_result": "profile_report",
     },
     {
         "id": "msgbroker_nats",
@@ -349,6 +355,8 @@ def load_prompt_text(item):
 PROMPT_CATALOG = [
     item for item in PROMPT_CATALOG if (REPO_ROOT / item["file"]).is_file()
 ]
+if not PROMPT_CATALOG:
+    raise RuntimeError(f"No configured prompt files exist under {REPO_ROOT}")
 
 for item in PROMPT_CATALOG:
     item["prompt"] = load_prompt_text(item)

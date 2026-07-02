@@ -542,20 +542,30 @@ except ImportError:
     w = None
 
 if w is not None:
-    prompt_dd = w.Dropdown(options=lab.MENU_PROMPT_IDS, value="video_infer_app",
+    default_prompt = ("video_infer_app" if "video_infer_app" in lab.MENU_PROMPT_IDS
+                      else lab.MENU_PROMPT_IDS[0])
+    prompt_dd = w.Dropdown(options=lab.MENU_PROMPT_IDS, value=default_prompt,
                            description="Prompt:", layout=w.Layout(width="60%"))
     prompt_status = w.HTML()   # visible confirmation a pick loaded (prompts share a first line)
     prompt_tx = w.Textarea(value=lab.prompt_text(prompt_dd.value),
                            layout=w.Layout(width="98%", height="240px"))
+    lab.set_selection(lab.AGENT, prompt_dd.value)
 
     def _set_status(pid):
         prompt_status.value = (f"<span style='color:#1a7f37'>&#9989; loaded prompt: "
                                f"<b>{pid}</b> &mdash; edit below or pick another</span>")
 
     def _on_pick(change):   # dropdown -> textarea: load the picked prompt's text (live link)
+        lab.set_selection(lab.AGENT, change["new"])
         prompt_tx.value = lab.prompt_text(change["new"])
         _set_status(change["new"])      # green line changes even when the text's first line looks the same
+
+    def _on_prompt_edit(change):
+        if change["name"] == "value":
+            lab.state["generated"] = False
+
     prompt_dd.observe(_on_pick, names="value")
+    prompt_tx.observe(_on_prompt_edit, names="value")
     _set_status(prompt_dd.value)
 
     gen_btn = w.Button(description="Generate", button_style="primary", icon="cogs")
@@ -565,7 +575,10 @@ if w is not None:
         pid, txt = prompt_dd.value, prompt_tx.value          # read widgets on the UI thread
         lab.run_step(out3, gen_btn, "Generate",
                               lambda: (lab.select_from_ui(pid, txt), lab.generate()),
-                              requires="installed", success_flag="generated")
+                              requires="installed", success_flag="generated",
+                              controls=tuple(c for c in (
+                                  prompt_dd, prompt_tx, globals().get("run_btn")
+                              ) if c is not None))
 
     gen_btn.on_click(_on_generate)
     display(prompt_dd, prompt_status, prompt_tx, gen_btn, out3)
@@ -616,7 +629,11 @@ if w is not None:
         # Start services, then RE-INVOKE the agent to run + fix the app it wrote, then show results.
         lab.run_step(out4, run_btn, "Run",
                               lambda: (lab.prepare_services(), lab.run_and_fix(), lab.show_results()),
-                              requires="generated")
+                              requires="generated",
+                              controls=tuple(c for c in (
+                                  globals().get("prompt_dd"), globals().get("prompt_tx"),
+                                  globals().get("gen_btn")
+                              ) if c is not None))
 
     run_btn.on_click(_on_run)
     display(run_btn, out4)

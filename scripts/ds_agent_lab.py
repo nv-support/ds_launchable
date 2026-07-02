@@ -42,7 +42,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from ds_lab_config import *  # config defaults + prompt catalog (ds_lab_config.py)
 
@@ -346,6 +346,9 @@ def set_selection(agent=None, prompt_id_or_text=None):
             raise ValueError("agent must be 'claude' or 'codex'")
         AGENT = agent
     if prompt_id_or_text is not None:
+        # A generated result belongs to the prompt that produced it. Invalidate that gate as soon
+        # as the user selects or edits another prompt, so Run cannot reuse the previous case.
+        state["generated"] = False
         text = prompt_id_or_text.strip()
         if text in PROMPT_SEQUENCES:  # a combined dropdown option -> two-stage sequence
             selected_sequence = list(PROMPT_SEQUENCES[text])
@@ -459,9 +462,9 @@ def build_agent_prompt():
         pass
     ctr_run_out = f"/workspace/agent_outputs/{SELECTED_PROMPT_ID}"
 
-    # Generate = PURE generation: the user's prompt VERBATIM + only one line saying WHERE to put
-    # the code (so the notebook can show it). NO run_demo.sh / headless / endpoints / harness rules
-    # here -- those are the Run step's job (build_run_prompt). Generate just generates.
+    # Ordinary Generate = the user's prompt VERBATIM + only one line saying WHERE to put the code.
+    # The agent remains free to choose useful validation. We do not inject run_demo.sh / display /
+    # endpoint rules here -- those are the formal Run step's job (build_run_prompt).
     # Option A: normal prompts Generate with cwd = their OWN empty app dir (see generate()), so the
     # agent can't read other prompts' code / their run_prompt.md (the headless "never use nv3dsink"
     # RUN_CONTRACT) and copy it -- that cross-prompt bleed was making every app come out fakesink.
@@ -486,6 +489,12 @@ def build_agent_prompt():
     if "prompt me" in _pl or "reply `y`" in _pl:
         where += ("\n(This runs headless and unattended -- you cannot prompt me. For every input the "
                   "request asks for, treat my answer as 'y': accept the default shown and proceed.)")
+    if selected.get("generate_result") == "profile_report":
+        where += (
+            f"\n(Save the final measured report as `{ctr_run_out}/profiling_report.txt`; include "
+            "the bottleneck, maximum 30-FPS stream count, measured per-stream FPS, and hardware "
+            "recommendation.)"
+        )
     prompt_text = selected["prompt"] + where
     prompt_path_host = run_out_host / "agent_prompt.md"
     prompt_path_host.write_text(prompt_text)
@@ -902,7 +911,13 @@ def _stream_agent_json(cmd, timeout):
     return proc.returncode
 
 
-def run_agent(prompt_path=None, log_name="agent_run.log", timeout=None, workdir="/workspace"):
+def run_agent(
+    prompt_path=None,
+    log_name="agent_run.log",
+    timeout=None,
+    workdir="/workspace",
+    synchronous=False,
+):
     """Run the selected agent headless in the container on the prompt at `prompt_path` (defaults
     to the WRITE prompt). claude uses stream-json so each action shows live; codex streams plain."""
     if prompt_path is None:
@@ -916,10 +931,46 @@ def run_agent(prompt_path=None, log_name="agent_run.log", timeout=None, workdir=
     ctr_log = f"{ctr_run_out}/{log_name}"
     # `set -o pipefail` so the agent's real exit status is not masked by `| tee`.
     if AGENT == "claude":
+        bash_env = ""
+        settings_arg = ""
+        if synchronous:
+            # `claude -p` owns background Bash processes and kills them when its turn ends. Keep the
+            # agent's command unchanged but rewrite that transport flag to foreground, so a long
+            # engine build completes before the model continues. This is deterministic: no polling,
+            # retry, or guessed sleep duration. The existing Generate watchdog remains the ceiling.
+            hook_code = (
+                "import json,sys;"
+                "event=json.load(sys.stdin);"
+                "tool_input=event.get('tool_input',{});"
+                "background=tool_input.get('run_in_background') is True;"
+                "tool_input['run_in_background']=False;"
+                "result={'hookSpecificOutput':{'hookEventName':'PreToolUse',"
+                "'permissionDecision':'allow','updatedInput':tool_input}};"
+                "print(json.dumps(result)) if background else None"
+            )
+            settings = {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"python3 -c {shlex.quote(hook_code)}",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+            bash_env = f"BASH_MAX_TIMEOUT_MS={timeout * 1000} "
+            settings_arg = f"--settings {shlex.quote(json.dumps(settings))} "
         inner = (
-            f'set -o pipefail; cd {shlex.quote(workdir)} && claude -p "$(cat {shlex.quote(prompt_path)})" '
+            f"set -o pipefail; cd {shlex.quote(workdir)} && {bash_env}"
+            f'claude -p "$(cat {shlex.quote(prompt_path)})" '
             f"--permission-mode bypassPermissions "
             f'--allowedTools "Read,Write,Edit,MultiEdit,Bash" '
+            f"{settings_arg}"
             f"--output-format stream-json --verbose "
             f"2>&1 | tee {shlex.quote(ctr_log)}"
         )
@@ -1058,6 +1109,40 @@ def _not_noise(p, root):
     return not any(part in _NOISE_DIRS for part in parts)
 
 
+def _jupyter_relative_path(path):
+    """Return a path relative to the live Jupyter root, falling back to legacy repo-root."""
+    roots = []
+    try:
+        from jupyter_server.serverapp import list_running_servers
+
+        for server in list_running_servers():
+            value = server.get("root_dir") or server.get("notebook_dir")
+            if value:
+                root = Path(value).expanduser().resolve()
+                if root not in roots:
+                    roots.append(root)
+    except Exception:
+        pass
+    if REPO_ROOT.resolve() not in roots:
+        roots.append(REPO_ROOT.resolve())
+    resolved = Path(path).expanduser().resolve()
+    for root in roots:
+        try:
+            return resolved.relative_to(root)
+        except ValueError:
+            continue
+    return None
+
+
+def _jupyter_file_url(path, download=False):
+    """Build a browser-fetchable `/files/` URL relative to the actual Jupyter server root."""
+    relative = _jupyter_relative_path(path)
+    if relative is None:
+        return None
+    url = "/files/" + quote(relative.as_posix(), safe="/")
+    return url + ("?download=1" if download else "")
+
+
 def show_generated_code(max_files=6, max_lines=400, show_code=True, exclude_large_mb=None):
     """SHOWCASE the skills -> code result: a working download link + each primary file (code,
     run_demo.sh, and config files) shown collapsible (<details>) with syntax highlighting.
@@ -1071,8 +1156,11 @@ def show_generated_code(max_files=6, max_lines=400, show_code=True, exclude_larg
 
     # The agent is told to save under output_dir; be robust if it nested under the run dir. Pick
     # the first location that actually holds code (ignoring the prompt file + run logs).
+    generated_root = WORKSPACE / selected["output_dir"]
+    if selected.get("generate_result") == "pdf_report":
+        generated_root = generated_root / MODEL_NAME
     candidates = [
-        WORKSPACE / selected["output_dir"],
+        generated_root,
         WORKSPACE / "agent_outputs" / SELECTED_PROMPT_ID,
     ]
     app_dir_host, all_files = None, []
@@ -1097,18 +1185,16 @@ def show_generated_code(max_files=6, max_lines=400, show_code=True, exclude_larg
         )
         return False
     print(f"Generated code for '{SELECTED_PROMPT_ID}' under {app_dir_host}")
-    try:  # outputs live under the Jupyter root_dir -> point to them in the left file browser
-        print(f"\U0001f4c2 Open in the left file browser: {app_dir_host.relative_to(REPO_ROOT)}/")
-    except ValueError:
-        pass
+    browser_relative = _jupyter_relative_path(app_dir_host)
+    browser_path = browser_relative.as_posix() if browser_relative else None
+    if browser_path:
+        print(f"\U0001f4c2 Open in the left file browser: {browser_path}/")
     if len(all_files) <= 20:
         print("Files: " + ", ".join(str(p.relative_to(app_dir_host)) for p in all_files))
     else:
         print(f"{len(all_files)} files generated (full list in the download).")
 
-    # Download: zip the generated files under REPO_ROOT (the Jupyter server's root_dir) and link
-    # via `/files/<path>` -- a real served URL the browser can fetch. (A bare/relative FileLink
-    # path 404s, which is why download wasn't working.)
+    # Download: zip under the repository, then build the URL relative to the live Jupyter root.
     import zipfile
 
     dl_dir = REPO_ROOT / "deploy/brev/_downloads"
@@ -1130,15 +1216,15 @@ def show_generated_code(max_files=6, max_lines=400, show_code=True, exclude_larg
             + ", ".join(sorted(p.name for p in skipped))
             + ")"
         )
-    try:
-        href = "/files/" + str(zip_path.relative_to(REPO_ROOT))
+    href = _jupyter_file_url(zip_path)
+    if href:
         emit_display(
             HTML(
                 f"<b>Download the generated code:</b> "
                 f'<a href="{href}" download>{zip_path.name}</a>'
             )
         )
-    except ValueError:
+    else:
         print(f"Download zip: {zip_path}")
 
     if not show_code:  # download-only: no inline content dump (report+config prompts)
@@ -1267,22 +1353,45 @@ _STEP_NAME = {
 }
 
 
-def run_step(out, button, label, work, requires=None, success_flag=None):
+def run_step(
+    out,
+    button,
+    label,
+    work,
+    requires=None,
+    success_flag=None,
+    controls=(),
+):
     """Run `work` SYNCHRONOUSLY on the kernel thread so its output renders reliably (background
     threads break Jupyter's output routing). Output STILL streams live as it runs -- the kernel
-    is just busy during the step and other clicks queue, which is fine here. Greys `button`,
-    shows the ✅/❌ banner, sets `success_flag` on success, and GATES: a no-op note if the prior
-    step has not succeeded yet."""
+    is just busy during the step. Disables `button` plus related `controls` for the full operation,
+    restores their prior states even after failure, shows the ✅/❌ banner, sets `success_flag` on
+    success, and gates the operation until `requires` has succeeded."""
     out.clear_output()
-    button.disabled = True
+    if requires and not state.get(requires, False):
+        with out:
+            prerequisite = _STEP_NAME.get(requires, requires)
+            klog(f"Complete '{prerequisite}' successfully before '{label}'.", "warn")
+        return False
+
+    locked = []
+    seen = set()
+    for control in (button, *controls):
+        if control is None or id(control) in seen:
+            continue
+        seen.add(id(control))
+        locked.append((control, control.disabled))
+        control.disabled = True
     try:
         with out:
             with step_status(label) as st:
                 work()
             if st.ok and success_flag:
                 state[success_flag] = True
+            return st.ok
     finally:
-        button.disabled = False
+        for control, was_disabled in locked:
+            control.disabled = was_disabled
 
 
 def run_demo():
@@ -1493,20 +1602,20 @@ def curl_microservice():
     _show_paths(dexec(f"curl -fsS {base}/openapi.json", capture_output=True).stdout, "live")
 
 
-def _serve_file(src):
+def _serve_file(src, download=False):
     """Return a Jupyter `/files/` URL for `src` so the browser STREAMS it (fast, no base64 bloat).
-    Direct when `src` is under REPO_ROOT (the server root_dir); otherwise copy it under
-    REPO_ROOT/deploy/brev/_downloads and serve that. None on failure (caller falls back to embed)."""
+    Use the live server root when possible; otherwise copy under the repository downloads dir and
+    retry. None on failure lets callers retain their existing embed/path fallback."""
     try:
         p = Path(src).resolve()
-        try:
-            return "/files/" + str(p.relative_to(REPO_ROOT))
-        except ValueError:  # outside the Jupyter root_dir -> copy under it, then serve
-            dst_dir = REPO_ROOT / "deploy/brev/_downloads" / SELECTED_PROMPT_ID
-            dst_dir.mkdir(parents=True, exist_ok=True)
-            dst = dst_dir / p.name
-            shutil.copy2(p, dst)
-            return "/files/" + str(dst.relative_to(REPO_ROOT))
+        direct = _jupyter_file_url(p, download=download)
+        if direct:
+            return direct
+        dst_dir = REPO_ROOT / "deploy/brev/_downloads" / SELECTED_PROMPT_ID
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / p.name
+        shutil.copy2(p, dst)
+        return _jupyter_file_url(dst, download=download)
     except (OSError, ValueError):
         return None
 
@@ -1516,11 +1625,14 @@ def show_results():
     from IPython.display import display, Video, HTML, FileLink
 
     sync_workspace_to_container()  # reuse-safe: read where the (reused) container maps /workspace
-    search_roots = [
-        WORKSPACE / "agent_outputs" / SELECTED_PROMPT_ID,
-        WORKSPACE / selected["output_dir"],
-    ]
-    if selected["needs_model_import"]:
+    search_roots = [WORKSPACE / "agent_outputs" / SELECTED_PROMPT_ID]
+    if selected.get("generate_result") == "pdf_report":
+        # The shared models cache may contain reports from other prompts or earlier model imports.
+        # Scope this result to the model selected for the current import.
+        search_roots.append(WORKSPACE / "models" / MODEL_NAME)
+    else:
+        search_roots.append(WORKSPACE / selected["output_dir"])
+    if selected["needs_model_import"] and selected.get("generate_result") != "pdf_report":
         search_roots.append(WORKSPACE / "models")
 
     def _collect(patterns):
@@ -1539,13 +1651,12 @@ def show_results():
     # The agent's run logs (agent_run.log / run_agent.log) are harness noise and are NEVER shown.
     artifact = selected["preferred_artifact"]
     klog(f"=== Results for '{SELECTED_PROMPT_ID}' (artifact: {artifact}) ===", "ok")
-    try:  # outputs live under the Jupyter root_dir -> point to them in the left file browser
-        print(
-            "\U0001f4c2 Browse these in the left file panel under: "
-            f"{(WORKSPACE / 'agent_outputs' / SELECTED_PROMPT_ID).relative_to(REPO_ROOT)}/"
-        )
-    except ValueError:
-        pass
+    browser_relative = _jupyter_relative_path(
+        WORKSPACE / "agent_outputs" / SELECTED_PROMPT_ID
+    )
+    browser_path = browser_relative.as_posix() if browser_relative else None
+    if browser_path:
+        print(f"\U0001f4c2 Browse these in the left file panel under: {browser_path}/")
     if artifact == "mp4":
         # Scope to THIS prompt's OWN output dirs -- NOT the shared models/ cache, which holds other
         # prompts' artifacts (e.g. import_vision's rtdetr sample videos) and would otherwise be shown
@@ -1589,26 +1700,19 @@ def show_results():
         # application/pdf renderer for cell output -- so the only reliable way to SHOW the PDF is to
         # rasterize each page to PNG (pdftoppm) and display via Image() (image/png is not sanitized,
         # so the formatted report renders exactly as in the PDF). The download uses a plain
-        # <a href=/files/...> anchor (anchors survive sanitizing). The file lives under WORKSPACE
-        # (outside the server root_dir), so copy it under REPO_ROOT for /files/ to serve it.
-        res_dir = REPO_ROOT / "deploy/brev/_downloads" / SELECTED_PROMPT_ID
-        res_dir.mkdir(parents=True, exist_ok=True)
+        # <a href=/files/...> anchors survive sanitizing. The shared helper maps them against the
+        # live server root (repo-root on A40, home-root on Brev) and copies only when necessary.
 
-        def _serve(src, download=False):  # copy under REPO_ROOT, return a /files/ URL
-            try:
-                dst = res_dir / src.name
-                shutil.copy2(src, dst)
-                rel = str(dst.relative_to(REPO_ROOT))
-                return "/files/" + rel + ("?download=1" if download else "")
-            except (OSError, ValueError):
-                return None
-
-        pdfs = _collect(("*.pdf",))
+        pdfs = [
+            path
+            for path in _collect(("benchmark_report*.pdf",))
+            if path.is_file() and path.stat().st_size > 0
+        ]
         pdf = pdfs[0] if pdfs else None
 
         # Download link first (reliable anchor).
         if pdf:
-            u = _serve(pdf, download=True)
+            u = _serve_file(pdf, download=True)
             if u:
                 emit_display(
                     HTML(f'<b>PDF report:</b> <a href="{u}" download>{pdf.name}</a> (download)')
@@ -1658,7 +1762,7 @@ def show_results():
             # offer it as a download instead.
             for h in _collect(("*.html",)):
                 if any(k in h.name.lower() for k in ("report", "benchmark")):
-                    u = _serve(h, download=True)
+                    u = _serve_file(h, download=True)
                     if u:
                         emit_display(
                             HTML(f'<b>HTML report:</b> <a href="{u}" download>{h.name}</a> (download)')
@@ -1765,10 +1869,9 @@ def show_results():
                 for f in sorted(svc_root.rglob(pat))[:20]:
                     print(f"  {f}")
     elif artifact == "profile_report":
-        # FIXED deliverable (same discipline as out.mp4 for video): the Run prompt (build_run_prompt)
-        # tells the agent to SAVE the report to exactly `<run_out>/profiling_report.txt`. Read THAT
-        # file -- no keyword globbing, no log tailing. If it's missing, the Run didn't finish the
-        # job; say so and let the user re-run Run (the prompt pins the target output).
+        # FIXED deliverable (same discipline as out.mp4 for video): the Generate request saves the
+        # report at exactly `<run_out>/profiling_report.txt`. Read THAT file --
+        # no keyword globbing or log tailing. If missing, Generate did not finish the requested job.
         import html as _html
 
         from IPython.display import HTML
@@ -1787,8 +1890,8 @@ def show_results():
             )
         else:
             print(
-                f"No profiling report at {report}. The Run step's job is to fix the app until it "
-                "writes that file -- re-run Run."
+                f"No profiling report at {report}. Re-run Generate so the profiling case can "
+                "finish its measured deliverable."
             )
         # Supplementary (not the deliverable): the Nsight capture, for the GUI trace.
         nsys = _collect(("*.nsys-rep",))
@@ -2042,6 +2145,42 @@ def print_plan(item=None):
     )
 
 
+def _generate_result_status(item):
+    """Return `(complete, missing_message)` for an execute-mode Generate deliverable."""
+    result = item.get("generate_result")
+    if result == "pdf_report":
+        report_dir = WORKSPACE / "models" / MODEL_NAME / "reports"
+        complete = any(
+            path.is_file() and path.stat().st_size > 0
+            for path in report_dir.glob("benchmark_report*.pdf")
+        )
+        return (
+            complete,
+            f"no non-empty benchmark PDF was written under {report_dir}",
+        )
+    if result == "profile_report":
+        report = WORKSPACE / "agent_outputs" / item["id"] / "profiling_report.txt"
+        try:
+            report_text = report.read_text(errors="replace").lower()
+        except OSError:
+            report_text = ""
+        required_conclusions = (
+            "bottleneck",
+            "stream",
+            "fps",
+        )
+        has_hardware_recommendation = any(
+            word in report_text for word in ("hardware", "upgrade", "recommend")
+        )
+        complete = all(word in report_text for word in required_conclusions)
+        complete = complete and has_hardware_recommendation
+        return (
+            complete,
+            f"{report} is missing or does not contain the requested measured conclusions",
+        )
+    return False, f"unknown Generate result type: {result!r}"
+
+
 def _generate_one():
     """Generate ONE prompt's code (the body of a single Generate stage). Isolation is decided by
     the per-prompt `generate_in_workspace` flag:
@@ -2074,6 +2213,7 @@ def _generate_one():
     rc = run_agent(
         timeout=selected.get("generate_timeout"),  # import_vision needs a longer budget
         workdir="/workspace" if in_ws else app_dir_ctr,
+        synchronous=bool(selected.get("generate_result")),
     )
     # Show whatever was produced, then judge success by the presence of the Generate DELIVERABLE.
     # On failure RAISE (SystemExit) so the step banner shows FAILED and 'generated' stays unset (which
@@ -2091,23 +2231,17 @@ def _generate_one():
             "Not dumped inline -- this prompt's output is a report + config files. "
             "The report is rendered at the Run step; download link below."
         )
-        show_generated_code(show_code=False, exclude_large_mb=25)
-        # Deliverable = the pipeline's FINAL product, a non-empty PDF report. Partial artifacts
-        # (engine, parser) can exist even when the benchmark/report stage never ran -> key off the PDF.
-        roots = {WORKSPACE / selected["output_dir"]}
-        if selected["needs_model_import"]:
-            roots.add(WORKSPACE / "models")
-        produced = any(
-            p.is_file() and p.stat().st_size > 0
-            for root in roots
-            if root.exists()
-            for p in root.rglob("*.pdf")
-        )
-        missing = "no non-empty PDF report was written under models/<name>/reports/"
+        code_or_files_produced = show_generated_code(show_code=False, exclude_large_mb=25)
     else:
-        # Normal prompts: Generate writes the app CODE (it is run + fixed later at the Run step).
         print("\n=== Generated code (your prompt -> code) ===")
-        produced = show_generated_code()  # True iff meaningful code files were written
+        code_or_files_produced = show_generated_code()
+
+    if selected.get("generate_result"):
+        # Measurement-driven prompts succeed only when their real report exists. Source files,
+        # engines, or an exit code alone are partial progress, not the requested deliverable.
+        produced, missing = _generate_result_status(selected)
+    else:
+        produced = code_or_files_produced
         missing = "no application code was written to the app directory"
 
     # Success requires BOTH a clean agent exit AND the real deliverable. Checking the deliverable
@@ -2123,8 +2257,8 @@ def _generate_one():
             )
         else:
             reason = (
-                f"{missing} -- the agent most likely ended its run early (e.g. deferred with a "
-                "scheduled wake-up, which this headless `claude -p` run cannot resume)"
+                f"{missing} -- the agent exited before producing the required final artifact; "
+                "inspect agent_run.log for the first incomplete or failed stage"
             )
         raise SystemExit(
             f"Generate did not complete for '{SELECTED_PROMPT_ID}': {reason}. Re-run Generate; "
@@ -2133,8 +2267,11 @@ def _generate_one():
 
 
 def generate():
-    """Generate step = PURE generation: run the agent to WRITE code from your prompt verbatim, then SHOW it.
-    The agent is NOT asked to run/build/install here -- all execution is the Run step's job.
+    """Generate from the user's prompt while leaving implementation/validation choices to the agent.
+
+    Catalog entries that declare a measured `generate_result` must complete that report in this
+    one-shot invocation. Other prompts normally author code here and receive formal runtime
+    validation in the Run step, without a Generate-phase prohibition.
 
     A combined dropdown pick (e.g. `rtvi_vlm_core_app & rtvi_vlm_openapi_spec`) sets
     `selected_sequence`; we then generate each stage IN ORDER on the shared output dir -- the core
@@ -2161,13 +2298,11 @@ def run_and_fix():
 
     WYSIWYG: the agent runs+fixes on a COPY of the generated app (under the run-out dir), so the
     code shown in the Generate step stays exactly as generated -- run-time tweaks don't rewrite it."""
-    if selected["id"] == "import_vision_model_detection_pipeline":
-        # End-to-end "onboard" prompt: its whole pipeline (download -> engine build -> benchmark
-        # -> PDF report) already ran during Generate. Nothing to run/fix here -- show_results()
-        # renders the report it wrote under models/<name>/reports/.
+    if selected.get("generate_result"):
+        # Measurement-driven prompts already produced their final report during Generate.
         klog(
-            "\nimport_vision ran its full pipeline at Generate (engine build + benchmark + "
-            "report); nothing to re-run here -- showing the report it produced below.",
+            f"\n{selected['id']} completed its measured report during Generate; nothing to "
+            "re-run here -- showing the saved result below.",
             "step",
         )
         return

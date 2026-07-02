@@ -15,17 +15,28 @@ The notebook is six steps plus an optional cleanup:
 6. **Run and view results** -- start the services the scenario needs, run + fix the app (modifying the generated code for the current runtime), and render the result.
 7. **Cleanup** _(optional)_ -- remove the lab containers; generated code + artifacts stay in the output workspace.
 
+Generate and Run are separate stateful operations. Generate leaves implementation choices to the
+agent; a prompt may cause the agent to run its own checks, but the notebook does not require a
+general application run during this step. Run applies the selected scenario's runtime instructions
+and validates the resulting artifacts. While either operation is active, the prompt selector,
+prompt editor, and the other operation button are disabled. Changing the selected prompt or editing
+its text invalidates the previous Generate result, so Run cannot accidentally use artifacts from a
+different prompt.
+
 ## Files
 
 ```
-<repo root>/                                 # = the Jupyter server's root_dir
+<deepstream root>/                           # repository root = Jupyter root_dir
   deploy/brev/
     deepstream_code_agent_launchable.ipynb   # the notebook (GENERATED -- do not hand-edit for logic)
     README.md
     scripts/
+      brev_post_setup.sh  # fresh-Brev host, Jupyter, checkout, image, and readiness setup
       build_notebook.py    # SOURCE OF TRUTH for the .ipynb (run it to regenerate)
       ds_lab_config.py     # config + PROMPT_CATALOG (paths, images, endpoints, prompts) -- data only
       ds_agent_lab.py      # the engine the notebook imports as `lab` (docker/agent/generate/run/results + ensure_ipywidgets)
+      serve_vlm.sh         # local VLM service launcher used only by VLM scenarios
+    tests/                 # notebook/runtime/deployment regression contracts
   example_prompts/         # the 14 prompt .md (1:1 with PROMPT_CATALOG) + rtvi_vlm_openapi_spec.png attachment
   skills/                  # deepstream-dev + deepstream-import-vision-model + deepstream-profile-pipeline (the Install step copies these into the agent)
 ```
@@ -36,27 +47,38 @@ required. At import the catalog is loaded from `example_prompts/*.md`; the envir
 named skills into the agent. `REPO_ROOT` is derived from the module's own location
 (`deploy/brev/scripts/ds_agent_lab.py`, three levels up), never hard-coded.
 
-## Deploy / run
+## Brev deployment
 
-Prereqs: a GPU host with **Docker + the NVIDIA Container Toolkit**, and access to the DeepStream
-image `nvcr.io/nvidia/deepstream:9.0-triton-multiarch`.
+Use `scripts/brev_post_setup.sh` as the Brev post-setup script on a fresh machine. It deliberately
+starts with `#!/bin/bash`, uses the Brev-managed `uv` and Python environment, and does not replace
+that environment. By default it prepares the checkout at `$HOME/deepstream` and completes only
+after all of the following readiness gates pass:
 
-1. Get the files: the **repo root that contains `deploy/`, `example_prompts/`, and `skills/`**
-   (clone the repo, or copy those three together).
-2. Launch JupyterLab with **`root_dir` = that repo root**:
-   ```bash
-   jupyter lab --no-browser --ip=0.0.0.0 --port=8899 \
-     --ServerApp.token=<your-token> \
-     --ServerApp.root_dir=/path/to/REPO        # the dir containing deploy/ example_prompts/ skills/
-   ```
-3. Open `deploy/brev/deepstream_code_agent_launchable.ipynb` and run the cells top to bottom.
-   Authenticate at the Authenticate step -- account sign-in, an API key, or a custom endpoint
-   (held in memory, injected per agent call -- never written to disk). Advanced users can instead
-   set `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`, or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`
-   env vars and skip the Authenticate step.
+- Docker and the NVIDIA Container Toolkit are installed/configured and the daemon is reachable.
+- The Brev Python environment contains `pip`, `ipywidgets`, and the Jupyter widget extension; a
+  kernel-level widget MIME smoke test succeeds.
+- The DeepStream checkout contains the notebook, prompts, and skills in their expected locations.
+- `nvcr.io/nvidia/deepstream:9.0-triton-multiarch` is fully pulled, has a repository digest, and
+  passes an NVIDIA GPU container smoke test.
+- `poppler-utils` is installed so PDF reports can be rendered as notebook images.
+- `jupyter.service`, its HTTP API, and the notebook contents endpoint are all ready.
+
+The script is intentionally fail-fast: a successful Brev post-setup means the environment is ready,
+not merely that installation commands were started. It accepts optional environment overrides
+documented at the top of the script, including `WORK_ROOT`, `DEEPSTREAM_IMAGE`,
+`SKIP_HOST_SETUP`, `SKIP_IMAGE_PULL`, and `SKIP_JUPYTER_SETUP`.
+
+The deployment assumes the DeepStream checkout is Jupyter's `ServerApp.root_dir`. Open
+`deploy/brev/deepstream_code_agent_launchable.ipynb` and run the cells top to bottom. All paths in
+this document are relative to that DeepStream root unless stated otherwise.
+
+Authenticate at the Authenticate step -- account sign-in, an API key, or a custom endpoint
+(held in memory, injected per agent call -- never written to disk). Advanced users can instead
+set `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`, or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`
+environment variables and skip the Authenticate step.
 
 **Where outputs go.** Generated code + run results land in **`deploy/brev/outputs/`** (the default
-`OUTPUT_ROOT`, right next to the notebook and still under `root_dir`), so they show up in the
+`OUTPUT_ROOT`, right next to the notebook and below the supported Jupyter roots), so they show up in the
 **left-hand file browser** and survive a page refresh:
 - `deploy/brev/outputs/workspace/<app_dir>/` -- the generated code
 - `deploy/brev/outputs/workspace/agent_outputs/<prompt_id>/` -- the run artifacts (mp4 / openapi.json / ...)
@@ -64,8 +86,12 @@ image `nvcr.io/nvidia/deepstream:9.0-triton-multiarch`.
 To put outputs elsewhere, set `OUTPUT_ROOT` -- but keep it **under your Jupyter `root_dir`** if you
 want them in the file browser:
 ```bash
-OUTPUT_ROOT=<root_dir>/ds_outputs jupyter lab --ServerApp.root_dir=<root_dir> ...
+OUTPUT_ROOT="$PWD/ds_outputs" jupyter lab --ServerApp.root_dir="$PWD" ...
 ```
+
+Artifact links are derived from the running Jupyter server's actual DeepStream `root_dir`. Report
+results prefer the generated PDF and render its pages as images. Markdown is used only as a fallback
+when a PDF is absent or cannot be rasterized.
 
 If you refresh the page (F5), live step outputs clear (your kernel + files are safe). Turn on
 **Settings -> Save Widget State Automatically**, or re-show a result with `lab.show_generated_code()`
@@ -90,6 +116,31 @@ Pick up changes in a running notebook:
   reloads the lab modules fresh -- no kernel restart needed). The Generate/Run steps reuse the
   loaded module, so your agent / creds / selection survive.
 - After regenerating the **`.ipynb`** -> reload it in the browser (**File -> Reload Notebook from Disk**).
+
+## Regression tests
+
+Run the Brev regression suite from the repository root:
+
+```bash
+JUPYTER_PLATFORM_DIRS=1 PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s deploy/brev/tests -v
+```
+
+The suite uses temporary directories rather than machine-specific paths. Its contracts cover:
+
+- prompt selection/edit invalidation and agent-only selection preservation;
+- Generate/Run prerequisite enforcement, cross-control locking, failure recovery, and success state;
+- autonomous Generate behavior plus prompt-specific report requirements;
+- exact PDF/report ownership and profiling-report semantic validation;
+- PDF-first rendering with Markdown fallback;
+- Jupyter-root-relative artifact paths and URL escaping;
+- prompt catalog behavior for complete and partial checkouts;
+- generated-notebook parity with `build_notebook.py`;
+- the Brev post-setup, removed legacy bootstrap, and required VLM launcher.
+
+`serve_vlm.sh` is not a general startup service. `ds_agent_lab.py` invokes it only for scenarios
+whose prompt metadata requires a local VLM endpoint, so it must remain beside the other Brev
+scripts even when most test cases do not use it.
 
 ## Configurable env vars (all optional; sensible defaults)
 
