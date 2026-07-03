@@ -564,6 +564,9 @@ if w is not None:
     def _on_prompt_edit(change):
         if change["name"] == "value":
             lab.state["generated"] = False
+            run_control = globals().get("run_btn")
+            if run_control is not None:
+                run_control.disabled = True
 
     prompt_dd.observe(_on_pick, names="value")
     prompt_tx.observe(_on_prompt_edit, names="value")
@@ -574,12 +577,15 @@ if w is not None:
 
     def _on_generate(_):
         pid, txt = prompt_dd.value, prompt_tx.value          # read widgets on the UI thread
-        lab.run_step(out3, gen_btn, "Generate",
+        generated_ok = lab.run_step(out3, gen_btn, "Generate",
                               lambda: (lab.select_from_ui(pid, txt), lab.generate()),
                               requires="installed", success_flag="generated",
                               controls=tuple(c for c in (
                                   prompt_dd, prompt_tx, globals().get("run_btn")
                               ) if c is not None))
+        run_control = globals().get("run_btn")
+        if run_control is not None:
+            run_control.disabled = not generated_ok
 
     gen_btn.on_click(_on_generate)
     display(prompt_dd, prompt_status, prompt_tx, gen_btn, out3)
@@ -623,7 +629,8 @@ except ImportError:
     w = None
 
 if w is not None:
-    run_btn = w.Button(description="Run & view results", button_style="success", icon="play")
+    run_btn = w.Button(description="Run & view results", button_style="success", icon="play",
+                       disabled=not lab.state["generated"])
     out4 = w.Output()
 
     def _on_run(_):

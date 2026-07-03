@@ -52,6 +52,15 @@ class NotebookSourceTests(unittest.TestCase):
         self.assertIn('globals().get("gen_btn")', source)
         self.assertEqual(source.count("controls=tuple("), 2)
 
+    def test_run_control_tracks_generate_completion(self):
+        source = build_notebook.CODE_STEP3 + build_notebook.CODE_STEP4
+
+        self.assertIn("generated_ok = lab.run_step", source)
+        self.assertIn("if run_control is not None:", source)
+        self.assertIn("run_control.disabled = not generated_ok", source)
+        self.assertIn('run_control.disabled = True', source)
+        self.assertIn('disabled=not lab.state["generated"]', source)
+
     def test_default_prompt_has_public_subset_fallback(self):
         self.assertIn(
             '"video_infer_app" if "video_infer_app" in lab.MENU_PROMPT_IDS',

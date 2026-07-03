@@ -105,6 +105,40 @@ class GeneratePolicyTests(unittest.TestCase):
         self.assertEqual(updated["timeout"], 1800000)
         self.assertIs(updated["run_in_background"], False)
 
+    def test_combined_generate_displays_only_the_final_code_once(self):
+        stages = ["rtvi_vlm_core_app", "rtvi_vlm_openapi_spec"]
+        saved_selected = lab.selected
+        saved_prompt_id = lab.SELECTED_PROMPT_ID
+        saved_sequence = lab.selected_sequence
+
+        try:
+            lab.selected_sequence = stages
+            lab.selected = lab.catalog_by_id[stages[0]]
+            lab.SELECTED_PROMPT_ID = stages[0]
+            with tempfile.TemporaryDirectory(prefix="brev-sequence-") as tmp:
+                app = Path(tmp) / "rtvi_app"
+                app.mkdir()
+                (app / "main.py").write_text("print('combined app')\n")
+                with (
+                    mock.patch.object(lab, "WORKSPACE", Path(tmp)),
+                    mock.patch.object(lab, "sync_workspace_to_container"),
+                    mock.patch.object(
+                        lab, "dexec_root", return_value=mock.Mock(returncode=0)
+                    ),
+                    mock.patch.object(lab, "build_agent_prompt"),
+                    mock.patch.object(lab, "run_agent", return_value=0),
+                    mock.patch.object(lab, "show_generated_code", return_value=True) as show,
+                    mock.patch.object(lab, "klog"),
+                    mock.patch.object(lab, "print_plan"),
+                ):
+                    lab.generate()
+        finally:
+            lab.selected = saved_selected
+            lab.SELECTED_PROMPT_ID = saved_prompt_id
+            lab.selected_sequence = saved_sequence
+
+        show.assert_called_once_with()
+
 
 class GenerateResultValidationTests(unittest.TestCase):
     def setUp(self):

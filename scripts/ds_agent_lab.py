@@ -2211,7 +2211,7 @@ def _generate_result_status(item):
     return False, f"unknown Generate result type: {result!r}"
 
 
-def _generate_one():
+def _generate_one(show_output=True):
     """Generate ONE prompt's code (the body of a single Generate stage). Isolation is decided by
     the per-prompt `generate_in_workspace` flag:
       - normal prompts -> cwd = their OWN empty, cleared app dir, so the agent can't read other
@@ -2255,7 +2255,9 @@ def _generate_one():
     # output is a report + config files (not an app to read) set generate_display="download" -- we
     # still give the download (minus the huge model/engine binaries), but skip the inline dump; the
     # report itself is rendered at the Run step via show_results().
-    if selected.get("generate_display", "code") == "download":
+    if not show_output:
+        code_or_files_produced = True
+    elif selected.get("generate_display", "code") == "download":
         print(f"\n=== Generated files for '{SELECTED_PROMPT_ID}' (report + configs) ===")
         print(
             "Not dumped inline -- this prompt's output is a report + config files. "
@@ -2315,7 +2317,7 @@ def generate():
             selected = catalog_by_id[sub_id]
             SELECTED_PROMPT_ID = sub_id
             klog(f"\n----- Stage {n + 1}/{len(seq)}: {sub_id} -----", "step")
-            _generate_one()
+            _generate_one(show_output=n == len(seq) - 1)
         selected = catalog_by_id[seq[-1]]  # final stage = the deliverable Run/results target
         SELECTED_PROMPT_ID = seq[-1]
     else:
