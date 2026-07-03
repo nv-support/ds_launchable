@@ -106,9 +106,10 @@ Review these groups before running:
 - **Input and compatibility:** `SAMPLE_VIDEO` provides a known DeepStream sample, while
   `MIN_DRIVER_VERSION` protects the lab from an unsupported host driver.
 
-The cell uses `setdefault`, so values already supplied in the Jupyter environment are preserved.
-Edit a default here, or export an override before launch, when using a different image, storage
-location, service, or model endpoint. Re-run the cell whenever settings change.
+The cell assigns every value unconditionally and overwrites existing environment variables each
+time it runs. Edit defaults directly in the cell, then re-run it whenever settings change. For all
+settings except `AGENT_TIMEOUT`, re-run Step 3 (**Install**) afterward because the lab module
+captures those values when imported; `AGENT_TIMEOUT` takes effect on the next Generate instead.
 
 **Checkpoint:** the output should end with `Configuration set` and print the active values you
 will use in Step 2. Confirm the paths and image name now; correcting them later may require

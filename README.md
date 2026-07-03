@@ -23,6 +23,14 @@ prompt editor, and the other operation button are disabled. Changing the selecte
 its text invalidates the previous Generate result, so Run cannot accidentally use artifacts from a
 different prompt.
 
+Run works on an isolated copy so any runtime repair leaves the Generate output unchanged. The copy
+keeps application source, configuration, prompt-specific resources, ONNX models, TensorRT engines,
+parser shared libraries, and other generated artifacts. It excludes virtual environments,
+dependency installations, repository metadata, and disposable language/tool caches (`venv`,
+`.venv`, `node_modules`, `__pycache__`, `.cache`, test/type-check caches, and `.git`). If an
+application needs a runtime environment, its Run-stage setup creates one in the Run copy; a
+Generate-stage virtual environment is not treated as portable application content.
+
 ## Files
 
 ```

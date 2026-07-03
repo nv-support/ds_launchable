@@ -1,7 +1,7 @@
 #!/bin/bash
 set -Eeuo pipefail
 
-POST_SETUP_VERSION=2026-07-02.6
+POST_SETUP_VERSION=2026-07-03.2
 WORK_ROOT=${WORK_ROOT:-"$HOME"}
 DEEPSTREAM_REPO_URL=${DEEPSTREAM_REPO_URL:-https://github.com/NVIDIA/DeepStream.git}
 LAUNCHABLE_REPO_URL=${LAUNCHABLE_REPO_URL:-https://github.com/nv-support/ds_launchable.git}
@@ -109,14 +109,14 @@ install_host_prerequisites() {
   sudo systemctl restart docker
 }
 
-install_jupyter_widgets() {
+prepare_jupyter_environment() {
   if [[ "$SKIP_JUPYTER_SETUP" == "1" ]]; then
-    section "Jupyter widgets"
+    section "Jupyter environment"
     printf 'Skipped because SKIP_JUPYTER_SETUP=1\n'
     return
   fi
 
-  section "Jupyter widgets"
+  section "Jupyter environment"
   local uv_bin=${UV_BIN:-"$HOME/.local/bin/uv"}
   local venv_python=${BREV_PYTHON:-"$HOME/.venv/bin/python3"}
   local jupyter_bin=${BREV_JUPYTER:-"$HOME/.venv/bin/jupyter"}
@@ -158,7 +158,19 @@ if required not in mime_types:
 print("Jupyter widget kernel smoke test: PASS")
 '
 
-  printf 'Jupyter widget environment verified; service restart is deferred to the final readiness gate.\n'
+  require_command curl
+  local attempt
+  for attempt in $(seq 1 60); do
+    if curl -fsS --max-time 5 \
+      -H 'Referer: http://127.0.0.1:8888/' \
+      http://127.0.0.1:8888/api/status >/dev/null 2>&1; then
+      printf 'Jupyter dependencies, widget MIME, and HTTP API are ready.\n'
+      return
+    fi
+    sleep 2
+  done
+
+  die "Jupyter HTTP API did not become ready within 120 seconds"
 }
 
 select_docker_command() {
@@ -227,45 +239,12 @@ pull_and_verify_image() {
   "${DOCKER[@]}" run --rm --gpus all "$DEEPSTREAM_IMAGE" nvidia-smi
 }
 
-restart_and_wait_for_jupyter() {
-  if [[ "$SKIP_JUPYTER_SETUP" == "1" ]]; then
-    section "Jupyter readiness"
-    printf 'Skipped because SKIP_JUPYTER_SETUP=1\n'
-    return
-  fi
-
-  section "Jupyter final readiness"
-  require_command systemctl
-  require_command curl
-  sudo systemctl restart jupyter
-
-  local attempt notebook_url
-  notebook_url=http://127.0.0.1:8888/api/contents/deepstream/deploy/brev/deepstream_code_agent_launchable.ipynb
-  for attempt in $(seq 1 60); do
-    if systemctl is-active --quiet jupyter \
-      && curl -fsS --max-time 5 \
-        -H 'Referer: http://127.0.0.1:8888/' \
-        http://127.0.0.1:8888/api/status >/dev/null 2>&1 \
-      && curl -fsS --max-time 5 \
-        -H 'Referer: http://127.0.0.1:8888/' \
-        "$notebook_url" >/dev/null 2>&1; then
-      printf 'jupyter.service, HTTP API, and launchable notebook are ready.\n'
-      return
-    fi
-    sleep 2
-  done
-
-  systemctl status jupyter --no-pager -l || true
-  die "Jupyter did not become ready within 120 seconds"
-}
-
 main() {
   printf 'Post-setup version: %s\n' "$POST_SETUP_VERSION"
   install_host_prerequisites
-  install_jupyter_widgets
   assemble_workspace
   pull_and_verify_image
-  restart_and_wait_for_jupyter
+  prepare_jupyter_environment
 
   section "Brev post-setup complete"
   printf 'DeepStream repository: %s\n' "$TARGET_DIR"

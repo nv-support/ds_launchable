@@ -76,6 +76,54 @@ class RunStepStateTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(called, [])
 
+    def test_existing_container_agent_restores_installed_gate(self):
+        lab.state["installed"] = False
+        saved_agent = lab.AGENT
+        lab.AGENT = ""
+        called = []
+
+        def probe(command, **_kwargs):
+            installed = "command -v claude" in command[-1]
+            return SimpleNamespace(returncode=0 if installed else 1)
+
+        try:
+            with (
+                mock.patch.object(lab.subprocess, "run", side_effect=probe),
+                mock.patch.object(lab, "step_status", successful_status),
+            ):
+                result = lab.run_step(
+                    FakeOutput(),
+                    FakeControl(),
+                    "Generate",
+                    lambda: called.append(True),
+                    requires="installed",
+                )
+        finally:
+            restored_agent = lab.AGENT
+            lab.AGENT = saved_agent
+
+        self.assertTrue(result)
+        self.assertEqual(called, [True])
+        self.assertTrue(lab.state["installed"])
+        self.assertEqual(restored_agent, "claude")
+
+    def test_stale_installed_state_does_not_bypass_container_probe(self):
+        lab.state["installed"] = True
+        called = []
+
+        with mock.patch.object(lab, "_installed_agent_available", return_value=False):
+            result = lab.run_step(
+                FakeOutput(),
+                FakeControl(),
+                "Generate",
+                lambda: called.append(True),
+                requires="installed",
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(called, [])
+        self.assertFalse(lab.state["installed"])
+
     def test_related_controls_stay_locked_for_the_full_operation(self):
         button = FakeControl()
         prompt = FakeControl()

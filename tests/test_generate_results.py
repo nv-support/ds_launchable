@@ -19,6 +19,13 @@ sys.path.insert(0, str(SCRIPTS))
 lab = importlib.import_module("ds_agent_lab")
 
 
+def require_catalog_item(test_case, prompt_id):
+    item = lab.catalog_by_id.get(prompt_id)
+    if item is None:
+        test_case.skipTest(f"prompt is not present in this partial checkout: {prompt_id}")
+    return item
+
+
 class GeneratePolicyTests(unittest.TestCase):
     def test_ordinary_generate_keeps_agent_autonomy(self):
         item = lab.catalog_by_id["video_infer_app"]
@@ -36,7 +43,7 @@ class GeneratePolicyTests(unittest.TestCase):
         self.assertNotIn(lab.RUN_CONTRACT, prompt)
 
     def test_profile_generate_pins_the_measured_report_path(self):
-        item = lab.catalog_by_id["ds_profiling_efficient_pipeline"]
+        item = require_catalog_item(self, "ds_profiling_efficient_pipeline")
         with (
             tempfile.TemporaryDirectory() as tmp,
             mock.patch.object(lab, "WORKSPACE", Path(tmp)),
@@ -146,7 +153,7 @@ class GenerateResultValidationTests(unittest.TestCase):
         self.assertFalse(complete)
 
     def test_incomplete_profiling_text_is_rejected(self):
-        item = lab.catalog_by_id["ds_profiling_efficient_pipeline"]
+        item = require_catalog_item(self, "ds_profiling_efficient_pipeline")
         report = lab.WORKSPACE / "agent_outputs" / item["id"] / "profiling_report.txt"
         report.parent.mkdir(parents=True)
         report.write_text("Profiling finished.\n")
@@ -156,7 +163,7 @@ class GenerateResultValidationTests(unittest.TestCase):
         self.assertFalse(complete)
 
     def test_profiling_report_requires_requested_conclusions(self):
-        item = lab.catalog_by_id["ds_profiling_efficient_pipeline"]
+        item = require_catalog_item(self, "ds_profiling_efficient_pipeline")
         report = lab.WORKSPACE / "agent_outputs" / item["id"] / "profiling_report.txt"
         report.parent.mkdir(parents=True)
         report.write_text(
@@ -171,7 +178,134 @@ class GenerateResultValidationTests(unittest.TestCase):
         self.assertTrue(complete)
 
 
+class RunCopyBoundaryTests(unittest.TestCase):
+    def test_copy_keeps_application_artifacts_and_excludes_runtime_directories(self):
+        retained = {
+            "main.py": b"print('run')\n",
+            "config/app.yaml": b"batch-size: 1\n",
+            "models/detector.onnx": b"onnx",
+            "models/detector.engine": b"engine",
+            "parser/libnvdsparse.so": b"shared-object",
+            "assets/prompt-specific.resource": b"resource",
+        }
+        excluded = (
+            "venv/marker",
+            ".venv/marker",
+            "node_modules/marker",
+            "__pycache__/marker",
+            ".cache/marker",
+            ".pytest_cache/marker",
+            ".mypy_cache/marker",
+            ".ruff_cache/marker",
+            ".git/marker",
+            "nested/venv/marker",
+            "nested/.cache/marker",
+        )
+
+        with tempfile.TemporaryDirectory(prefix="brev-run-copy-") as tmp:
+            root = Path(tmp)
+            source = root / "generated"
+            destination = root / "run-copy"
+            for relative, content in retained.items():
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            for relative in excluded:
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("exclude me")
+            destination.mkdir()
+            (destination / "stale.txt").write_text("old run")
+
+            subprocess.run(
+                ["bash", "-lc", lab._run_copy_command(source, destination)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+
+            for relative, content in retained.items():
+                self.assertEqual((destination / relative).read_bytes(), content)
+            for relative in excluded:
+                self.assertFalse((destination / relative).exists(), relative)
+                self.assertTrue((source / relative).exists(), relative)
+            self.assertFalse((destination / "stale.txt").exists())
+
+    def test_run_and_fix_no_longer_uses_unbounded_cp(self):
+        source = (SCRIPTS / "ds_agent_lab.py").read_text()
+        run_and_fix = source[source.index("def run_and_fix():") : source.index("def run_and_view():")]
+
+        self.assertNotIn("cp -a", run_and_fix)
+
+
 class ResultRenderingTests(unittest.TestCase):
+    def test_mp4_uses_simple_html_video_with_streamed_url(self):
+        item = lab.catalog_by_id["yolov26s_detection"]
+        with tempfile.TemporaryDirectory(prefix="brev-video-url-") as tmp:
+            workspace = Path(tmp)
+            video = workspace / "agent_outputs" / item["id"] / "out.mp4"
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"small-video")
+            rendered = []
+
+            class Marker:
+                def __init__(self, kind, args, kwargs):
+                    self.kind = kind
+                    self.args = args
+                    self.kwargs = kwargs
+
+            with (
+                mock.patch.object(lab, "WORKSPACE", workspace),
+                mock.patch.object(lab, "selected", item),
+                mock.patch.object(lab, "SELECTED_PROMPT_ID", item["id"]),
+                mock.patch.object(lab, "sync_workspace_to_container"),
+                mock.patch.object(lab, "_jupyter_relative_path", return_value=None),
+                mock.patch.object(lab, "_serve_file", return_value="/files/out.mp4") as serve,
+                mock.patch.object(lab, "emit_display", side_effect=rendered.append),
+                mock.patch(
+                    "IPython.display.Video",
+                    side_effect=lambda *a, **k: Marker("video", a, k),
+                ),
+                mock.patch(
+                    "IPython.display.HTML",
+                    side_effect=lambda *a, **k: Marker("html", a, k),
+                ),
+            ):
+                lab.show_results()
+
+        players = [marker for marker in rendered if marker.kind == "html"]
+        self.assertEqual(len(players), 1)
+        markup = players[0].args[0]
+        self.assertEqual(
+            markup,
+            '<video controls width="900" src="/files/out.mp4"></video>',
+        )
+        serve.assert_called_once_with(video)
+
+    def test_mp4_never_falls_back_to_base64_when_url_is_unavailable(self):
+        item = lab.catalog_by_id["yolov26s_detection"]
+        with tempfile.TemporaryDirectory(prefix="brev-video-no-url-") as tmp:
+            workspace = Path(tmp)
+            video = workspace / "agent_outputs" / item["id"] / "out.mp4"
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"video")
+            rendered = []
+
+            with (
+                mock.patch.object(lab, "WORKSPACE", workspace),
+                mock.patch.object(lab, "selected", item),
+                mock.patch.object(lab, "SELECTED_PROMPT_ID", item["id"]),
+                mock.patch.object(lab, "sync_workspace_to_container"),
+                mock.patch.object(lab, "_jupyter_relative_path", return_value=None),
+                mock.patch.object(lab, "_serve_file", return_value=None),
+                mock.patch.object(lab, "emit_display", side_effect=rendered.append),
+                mock.patch("IPython.display.Video") as video_display,
+            ):
+                lab.show_results()
+
+        video_display.assert_not_called()
+        self.assertEqual(rendered, [])
+
     def test_show_results_has_no_call_to_removed_serve_helper(self):
         tree = ast.parse((SCRIPTS / "ds_agent_lab.py").read_text())
         calls = [

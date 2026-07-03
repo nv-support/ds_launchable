@@ -33,6 +33,14 @@ class NotebookSourceTests(unittest.TestCase):
             self.assertEqual(cell.cell_type, "markdown" if kind == "md" else "code")
             self.assertEqual(cell.source, source.rstrip("\n"))
 
+    def test_config_docs_match_unconditional_assignment_behavior(self):
+        docs = build_notebook.MD_CONFIG
+
+        self.assertNotIn("uses `setdefault`", docs)
+        self.assertIn("overwrites existing environment variables", docs)
+        self.assertIn("re-run Step 3 (**Install**)", docs)
+        self.assertIn("`AGENT_TIMEOUT` takes effect on the next Generate", docs)
+
     def test_prompt_callbacks_invalidate_and_lock_cross_step_controls(self):
         source = build_notebook.CODE_STEP3 + build_notebook.CODE_STEP4
 
@@ -95,6 +103,28 @@ class DeploymentScriptTests(unittest.TestCase):
         self.assertTrue(post_setup.read_text().startswith("#!/bin/bash\n"))
         self.assertIn("poppler-utils", post_setup.read_text())
         subprocess.run(["bash", "-n", str(post_setup)], check=True)
+
+    def test_jupyter_readiness_avoids_redundant_notebook_url_probe(self):
+        source = (SCRIPTS / "brev_post_setup.sh").read_text()
+
+        self.assertIn(
+            '[[ -f "$TARGET_DIR/deploy/brev/deepstream_code_agent_launchable.ipynb" ]]',
+            source,
+        )
+        self.assertIn("http://127.0.0.1:8888/api/status", source)
+        self.assertNotIn("/api/contents/", source)
+        self.assertNotIn("notebook_url", source)
+        self.assertNotIn("from urllib.parse import quote", source)
+
+    def test_jupyter_preparation_has_one_platform_independent_readiness_gate(self):
+        source = (SCRIPTS / "brev_post_setup.sh").read_text()
+
+        self.assertIn("prepare_jupyter_environment()", source)
+        self.assertEqual(source.count("  prepare_jupyter_environment\n"), 1)
+        self.assertNotIn("install_jupyter_widgets()", source)
+        self.assertNotIn("restart_and_wait_for_jupyter()", source)
+        self.assertNotIn("systemctl restart jupyter", source)
+        self.assertNotIn("systemctl is-active --quiet jupyter", source)
 
     def test_vlm_launcher_is_present_and_referenced_by_runtime(self):
         launcher = SCRIPTS / "serve_vlm.sh"

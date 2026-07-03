@@ -1353,6 +1353,31 @@ _STEP_NAME = {
 }
 
 
+def _installed_agent_available():
+    """True when the existing work container already has the selected agent installed."""
+    global AGENT
+    candidates = (AGENT,) if AGENT in {"claude", "codex"} else ("claude", "codex")
+    for candidate in candidates:
+        result = subprocess.run(
+            [
+                "docker",
+                "exec",
+                "-u",
+                "agent",
+                AGENT_CONTAINER,
+                "bash",
+                "-lc",
+                f"command -v {candidate} >/dev/null 2>&1",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if result.returncode == 0:
+            AGENT = candidate
+            return True
+    return False
+
+
 def run_step(
     out,
     button,
@@ -1368,6 +1393,8 @@ def run_step(
     restores their prior states even after failure, shows the ✅/❌ banner, sets `success_flag` on
     success, and gates the operation until `requires` has succeeded."""
     out.clear_output()
+    if requires == "installed":
+        state["installed"] = _installed_agent_available()
     if requires and not state.get(requires, False):
         with out:
             prerequisite = _STEP_NAME.get(requires, requires)
@@ -1622,7 +1649,7 @@ def _serve_file(src, download=False):
 
 def show_results():
     """Scenario-branched artifact display + a full fallback listing."""
-    from IPython.display import display, Video, HTML, FileLink
+    from IPython.display import display, HTML, FileLink
 
     sync_workspace_to_container()  # reuse-safe: read where the (reused) container maps /workspace
     search_roots = [WORKSPACE / "agent_outputs" / SELECTED_PROMPT_ID]
@@ -1662,8 +1689,8 @@ def show_results():
         # prompts' artifacts (e.g. import_vision's rtdetr sample videos) and would otherwise be shown
         # as this prompt's result. Skip 0-byte / failed files (a stray empty out.mp4 from an
         # unfinalized sink must never win over the real video). Prefer the canonical out.mp4 (the run
-        # contract names it); else the LARGEST remaining real output. Show ONE, streamed via a /files
-        # URL not base64 (fast, no notebook bloat; a 96 MB embed = ~130 MB of base64 in the .ipynb).
+        # contract names it); else the LARGEST remaining real output. Stream through Jupyter's
+        # `/files/` endpoint without base64 so large videos do not bloat the notebook document.
         own = (
             str(WORKSPACE / "agent_outputs" / SELECTED_PROMPT_ID),
             str(WORKSPACE / selected["output_dir"]),
@@ -1681,8 +1708,11 @@ def show_results():
             url = _serve_file(pick)
             if url:
                 emit_display(HTML(f'<video controls width="900" src="{url}"></video>'))
-            else:  # outside root_dir and copy failed -- fall back to base64 embed
-                emit_display(Video(str(pick), embed=True, html_attributes="controls width=900"))
+            else:
+                print(
+                    "Could not build a Jupyter /files/ URL for this video; "
+                    f"open it from the file browser instead: {pick}"
+                )
             extra = [m for m in mp4s if m != pick]
             if extra:
                 print(f"({len(extra)} other .mp4 not shown: {', '.join(m.name for m in extra)})")
@@ -2292,6 +2322,55 @@ def generate():
         _generate_one()
 
 
+_RUN_COPY_EXCLUDE_DIRS = (
+    "venv",
+    ".venv",
+    "node_modules",
+    "__pycache__",
+    ".cache",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".git",
+)
+
+
+def _run_copy_command(source, destination):
+    """Build the container-side command that creates a bounded Run copy.
+
+    Application files are copied by default so prompt-specific formats and resources survive.
+    Only non-portable runtime environments, dependency trees, and disposable caches are excluded.
+    """
+    src = shlex.quote(str(source))
+    dst = shlex.quote(str(destination))
+    excludes = " ".join(
+        f"--exclude={shlex.quote(f'./{name}')} --exclude={shlex.quote(f'*/{name}')}"
+        for name in _RUN_COPY_EXCLUDE_DIRS
+    )
+    return (
+        f"set -o pipefail; rm -rf {dst} && mkdir -p {dst} && "
+        f"tar -C {src} {excludes} -cf - . | tar -C {dst} -xf -"
+    )
+
+
+def _prepare_run_copy(source, destination):
+    """Create an isolated Run copy and fail instead of accepting a partial tree."""
+    klog(
+        "\nPreparing isolated Run copy (excluding virtual environments and caches) ...",
+        "step",
+    )
+    result = dexec(_run_copy_command(source, destination), capture_output=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if detail:
+            detail = "\n".join(detail.splitlines()[-20:])
+        raise SystemExit(
+            f"Could not prepare the Run copy from {source} to {destination}."
+            + (f"\n{detail}" if detail else "")
+        )
+    klog("Run copy ready.", "ok")
+
+
 def run_and_fix():
     """Run-step core: RE-INVOKE the agent with the Run-phase prompt -- it (re)creates run_demo.sh,
     adapts the code for this headless env, runs it, and FIXES until it produces the artifact.
@@ -2312,10 +2391,7 @@ def run_and_fix():
     run_dir = (
         f"{ctr_run_out}/app"  # copy the generated app here; agent works on this copy
     )
-    dexec(
-        f"rm -rf {shlex.quote(run_dir)} && mkdir -p {shlex.quote(run_dir)} && "
-        f"cp -a {shlex.quote(src)}/. {shlex.quote(run_dir)}/ 2>/dev/null || true"
-    )
+    _prepare_run_copy(src, run_dir)
     klog(
         "\nRunning ...",
         "step",
