@@ -1,15 +1,13 @@
 #!/bin/bash
 set -Eeuo pipefail
 
-POST_SETUP_VERSION=2026-07-03.2
+POST_SETUP_VERSION=2026-07-07.1
 WORK_ROOT=${WORK_ROOT:-"$HOME"}
-DEEPSTREAM_REPO_URL=${DEEPSTREAM_REPO_URL:-https://github.com/NVIDIA/DeepStream.git}
 LAUNCHABLE_REPO_URL=${LAUNCHABLE_REPO_URL:-https://github.com/nv-support/ds_launchable.git}
 DEEPSTREAM_IMAGE=${DEEPSTREAM_IMAGE:-nvcr.io/nvidia/deepstream:9.0-triton-multiarch}
 SKIP_HOST_SETUP=${SKIP_HOST_SETUP:-0}
 SKIP_IMAGE_PULL=${SKIP_IMAGE_PULL:-0}
 SKIP_JUPYTER_SETUP=${SKIP_JUPYTER_SETUP:-0}
-INSTALL_LAUNCHABLE_OVERLAY=${INSTALL_LAUNCHABLE_OVERLAY:-1}
 
 TARGET_DIR="$WORK_ROOT/deepstream"
 TEMP_DIR=""
@@ -183,32 +181,23 @@ select_docker_command() {
   fi
 }
 
-assemble_workspace() {
-  section "Clone public repositories"
+install_launchable_overlay() {
+  section "Install launchable overlay"
   require_command git
   require_command tar
-  [[ "$INSTALL_LAUNCHABLE_OVERLAY" == "0" || "$INSTALL_LAUNCHABLE_OVERLAY" == "1" ]] \
-    || die "INSTALL_LAUNCHABLE_OVERLAY must be 0 or 1"
 
-  [[ ! -e "$TARGET_DIR" ]] \
-    || die "target already exists; refusing to modify it: $TARGET_DIR"
+  [[ -d "$TARGET_DIR/.git" ]] \
+    || die "Brev-managed DeepStream checkout not found: $TARGET_DIR"
 
-  mkdir -p "$WORK_ROOT"
   TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ds-launchable.XXXXXX")
+  git clone --depth 1 "$LAUNCHABLE_REPO_URL" "$TEMP_DIR/ds_launchable"
 
-  git clone --depth 1 "$DEEPSTREAM_REPO_URL" "$TARGET_DIR"
-  if [[ "$INSTALL_LAUNCHABLE_OVERLAY" == "1" ]]; then
-    git clone --depth 1 "$LAUNCHABLE_REPO_URL" "$TEMP_DIR/ds_launchable"
+  mkdir -p "$TARGET_DIR/deploy/brev"
+  git -C "$TEMP_DIR/ds_launchable" archive --format=tar HEAD \
+    | tar -xf - -C "$TARGET_DIR/deploy/brev"
 
-    mkdir -p "$TARGET_DIR/deploy/brev"
-    git -C "$TEMP_DIR/ds_launchable" archive --format=tar HEAD \
-      | tar -xf - -C "$TARGET_DIR/deploy/brev"
-
-    [[ ! -e "$TARGET_DIR/deploy/brev/.git" ]] \
-      || die "unexpected nested Git metadata under deploy/brev"
-  else
-    printf 'Launchable overlay disabled; using deploy/brev from the DeepStream repository.\n'
-  fi
+  [[ ! -e "$TARGET_DIR/deploy/brev/.git" ]] \
+    || die "unexpected nested Git metadata under deploy/brev"
 
   [[ -f "$TARGET_DIR/deploy/brev/deepstream_code_agent_launchable.ipynb" ]] \
     || die "launchable notebook is missing under $TARGET_DIR/deploy/brev"
@@ -242,7 +231,7 @@ pull_and_verify_image() {
 main() {
   printf 'Post-setup version: %s\n' "$POST_SETUP_VERSION"
   install_host_prerequisites
-  assemble_workspace
+  install_launchable_overlay
   pull_and_verify_image
   prepare_jupyter_environment
 

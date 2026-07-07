@@ -135,6 +135,19 @@ class DeploymentScriptTests(unittest.TestCase):
         self.assertNotIn("systemctl restart jupyter", source)
         self.assertNotIn("systemctl is-active --quiet jupyter", source)
 
+    def test_post_setup_overlays_brev_managed_deepstream_checkout(self):
+        source = (SCRIPTS / "brev_post_setup.sh").read_text()
+
+        self.assertIn('[[ -d "$TARGET_DIR/.git" ]]', source)
+        self.assertIn("Brev-managed DeepStream checkout not found", source)
+        self.assertIn(
+            'git clone --depth 1 "$LAUNCHABLE_REPO_URL" "$TEMP_DIR/ds_launchable"',
+            source,
+        )
+        self.assertNotIn("DEEPSTREAM_REPO_URL", source)
+        self.assertNotIn("INSTALL_LAUNCHABLE_OVERLAY", source)
+        self.assertNotIn("target already exists; refusing to modify it", source)
+
     def test_vlm_launcher_is_present_and_referenced_by_runtime(self):
         launcher = SCRIPTS / "serve_vlm.sh"
         runtime_source = (SCRIPTS / "ds_agent_lab.py").read_text()

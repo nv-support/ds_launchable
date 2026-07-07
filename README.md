@@ -39,7 +39,7 @@ Generate-stage virtual environment is not treated as portable application conten
     deepstream_code_agent_launchable.ipynb   # the notebook (GENERATED -- do not hand-edit for logic)
     README.md
     scripts/
-      brev_post_setup.sh  # fresh-Brev host, Jupyter, checkout, image, and readiness setup
+      brev_post_setup.sh  # fresh-Brev host, launchable overlay, image, and readiness setup
       build_notebook.py    # SOURCE OF TRUTH for the .ipynb (run it to regenerate)
       ds_lab_config.py     # config + PROMPT_CATALOG (paths, images, endpoints, prompts) -- data only
       ds_agent_lab.py      # the engine the notebook imports as `lab` (docker/agent/generate/run/results + ensure_ipywidgets)
@@ -57,10 +57,12 @@ named skills into the agent. `REPO_ROOT` is derived from the module's own locati
 
 ## Brev deployment
 
-Use `scripts/brev_post_setup.sh` as the Brev post-setup script on a fresh machine. It deliberately
-starts with `#!/bin/bash`, uses the Brev-managed `uv` and Python environment, and does not replace
-that environment. By default it prepares the checkout at `$HOME/deepstream` and completes only
-after all of the following readiness gates pass:
+Configure the Brev launchable repository as `https://github.com/NVIDIA/DeepStream.git`, so Brev
+clones it to `$HOME/deepstream` before post-setup starts. Then use `scripts/brev_post_setup.sh` as
+the post-setup script. It deliberately starts with `#!/bin/bash`, uses the Brev-managed `uv` and
+Python environment, and does not replace that environment. The script requires the existing
+`$HOME/deepstream` Git checkout, clones only `ds_launchable`, and overlays its contents under
+`$HOME/deepstream/deploy/brev`. It completes only after all of the following readiness gates pass:
 
 - Docker and the NVIDIA Container Toolkit are installed/configured and the daemon is reachable.
 - The Brev Python environment contains `pip`, `ipywidgets`, and the Jupyter widget extension; a
@@ -73,8 +75,8 @@ after all of the following readiness gates pass:
 
 The script is intentionally fail-fast: a successful Brev post-setup means the environment is ready,
 not merely that installation commands were started. It accepts optional environment overrides
-documented at the top of the script, including `WORK_ROOT`, `DEEPSTREAM_IMAGE`,
-`SKIP_HOST_SETUP`, `SKIP_IMAGE_PULL`, and `SKIP_JUPYTER_SETUP`.
+documented at the top of the script, including `WORK_ROOT`, `LAUNCHABLE_REPO_URL`,
+`DEEPSTREAM_IMAGE`, `SKIP_HOST_SETUP`, `SKIP_IMAGE_PULL`, and `SKIP_JUPYTER_SETUP`.
 
 The deployment assumes the DeepStream checkout is Jupyter's `ServerApp.root_dir`. Open
 `deploy/brev/deepstream_code_agent_launchable.ipynb` and run the cells top to bottom. All paths in
