@@ -1,164 +1,153 @@
-# DeepStream Code Agent -- launchable
+# Generate and Validate a DeepStream Project with Code Agent
 
-A guided Jupyter notebook that turns a **natural-language prompt into a runnable DeepStream
-`pyservicemaker` app**. You pick a coding agent (Claude Code or Codex), install it into a stock
-DeepStream container, give it a scenario prompt, and it generates the app + configs + run scripts,
-runs it, and shows the result (MP4 / Kafka JSON / PDF report / VLM summary / FastAPI service).
+DeepStream Code Agent is a guided Jupyter lab for turning a natural-language scenario into a
+runnable DeepStream project or workflow. You choose a coding agent, install DeepStream skills,
+generate the requested artifacts, run them in a prepared GPU runtime, and inspect the evidence
+that the result worked.
 
-The notebook is six steps plus an optional cleanup:
+Many prompts generate `pyservicemaker` applications, but the prompt catalog is broader than that:
+some scenarios produce native message-broker adapters, automatic performance analysis reports,
+model-conversion assets, service wrappers, or API specifications.
 
-1. **Configuration** -- set the shared paths, image/container names, and runtime defaults (exported to env).
-2. **Check environment & create a DeepStream container workspace** -- check the GPU host, then start the stock DeepStream container with a mounted workspace.
-3. **Install your agent, DeepStream skills & runtime dependencies** -- choose Claude or Codex; installs the CLI + DeepStream skills + runtime deps.
-4. **Authenticate** -- provide credentials via account sign-in, an API key, or a custom endpoint (pick one from the method dropdown).
-5. **Generate** -- pick (or paste/edit) a scenario prompt; the agent writes the code, shown inline.
-6. **Run and view results** -- start the services the scenario needs, run + fix the app (modifying the generated code for the current runtime), and render the result.
-7. **Cleanup** _(optional)_ -- remove the lab containers; generated code + artifacts stay in the output workspace.
+Use this README as the entry point. The notebook contains the interactive lab; this page helps you
+prepare the machine, choose a good first scenario, follow the numbered steps, and know where the
+generated code and results are stored.
 
-Generate and Run are separate stateful operations. Generate leaves implementation choices to the
-agent; a prompt may cause the agent to run its own checks, but the notebook does not require a
-general application run during this step. Run applies the selected scenario's runtime instructions
-and validates the resulting artifacts. While either operation is active, the prompt selector,
-prompt editor, and the other operation button are disabled. Changing the selected prompt or editing
-its text invalidates the previous Generate result, so Run cannot accidentally use artifacts from a
-different prompt.
+## What you will build
 
-Run works on an isolated copy so any runtime repair leaves the Generate output unchanged. The copy
-keeps application source, configuration, prompt-specific resources, ONNX models, TensorRT engines,
-parser shared libraries, and other generated artifacts. It excludes virtual environments,
-dependency installations, repository metadata, and disposable language/tool caches (`venv`,
-`.venv`, `node_modules`, `__pycache__`, `.cache`, test/type-check caches, and `.git`). If an
-application needs a runtime environment, its Run-stage setup creates one in the Run copy; a
-Generate-stage virtual environment is not treated as portable application content.
+By the end of the workflow, you will have:
 
-## Files
+- a DeepStream workspace running inside a GPU-enabled container;
+- Claude Code or Codex installed with DeepStream development skills;
+- a generated DeepStream project with source, configuration, launch scripts, and notes;
+- runtime artifacts such as an annotated MP4, service output, JSON messages, or a PDF report;
+- a repeatable place to inspect, copy, or reuse the generated project.
 
-```
-<deepstream root>/                           # repository root = Jupyter root_dir
-  deploy/brev/
-    deepstream_code_agent_launchable.ipynb   # the notebook (GENERATED -- do not hand-edit for logic)
-    README.md
-    scripts/
-      brev_post_setup.sh  # fresh-Brev host, clone hook, image, and readiness setup
-      build_notebook.py    # SOURCE OF TRUTH for the .ipynb (run it to regenerate)
-      ds_lab_config.py     # config + PROMPT_CATALOG (paths, images, endpoints, prompts) -- data only
-      ds_agent_lab.py      # the engine the notebook imports as `lab` (docker/agent/generate/run/results + ensure_ipywidgets)
-      serve_vlm.sh         # local VLM service launcher used only by VLM scenarios
-    tests/                 # notebook/runtime/deployment regression contracts
-  example_prompts/         # the 14 prompt .md (1:1 with PROMPT_CATALOG) + rtvi_vlm_openapi_spec.png attachment
-  skills/                  # deepstream-dev + deepstream-import-vision-model + deepstream-profile-pipeline (the Install step copies these into the agent)
-```
+## Before you start
 
-`example_prompts/` and `skills/` sit at the **repo root, as siblings of `deploy/`** -- both are
-required. At import the catalog is loaded from `example_prompts/*.md`; the environment/workspace step (`%%bash`) stages
-`example_prompts/` into the mounted `/workspace`; and the Install step (`install_agent`) `docker cp`s the
-named skills into the agent. `REPO_ROOT` is derived from the module's own location
-(`deploy/brev/scripts/ds_agent_lab.py`, three levels up), never hard-coded.
+You need a host that can run DeepStream containers and a model-backed coding agent:
 
-## Brev deployment
+- an NVIDIA GPU host;
+- Docker and the NVIDIA Container Toolkit;
+- access to the configured DeepStream container image;
+- Jupyter Lab with this DeepStream repository as the working directory;
+- credentials for either Claude Code or Codex;
+- network access for image pulls, package installs, model downloads, and agent calls.
 
-Configure the Brev launchable repository as `https://github.com/NVIDIA/DeepStream.git`, then use
-`scripts/brev_post_setup.sh` as the post-setup script. Brev runs this script before its repository
-clone, so the script installs a one-time Git `post-checkout` hook under the current user's HOME.
-When Brev finishes cloning DeepStream, Git runs the hook, which clones `ds_launchable` and overlays
-it under `$HOME/deepstream/deploy/brev`. The hook removes itself and its HOME template after the
-overlay succeeds. The script deliberately starts with `#!/bin/bash`, uses the Brev-managed `uv`
-and Python environment, and does not replace that environment. It completes after the host and
-hook readiness gates pass:
+For a first run, use the `video_infer_app` prompt. It is short, file-based, and produces an
+annotated MP4, so it is the quickest way to confirm the full Generate -> Run -> Results loop.
 
-- Docker and the NVIDIA Container Toolkit are installed/configured and the daemon is reachable.
-- The Brev Python environment contains `pip`, `ipywidgets`, and the Jupyter widget extension; a
-  kernel-level widget MIME smoke test succeeds.
-- The HOME Git clone template is armed; the DeepStream clone hook validates the notebook after checkout.
-- `nvcr.io/nvidia/deepstream:9.0-triton-multiarch` is fully pulled, has a repository digest, and
-  passes an NVIDIA GPU container smoke test.
-- `poppler-utils` is installed so PDF reports can be rendered as notebook images.
-- Jupyter's HTTP API is responding.
+## Quick start on Brev
 
-The script is intentionally fail-fast: a successful Brev post-setup means the host and clone hook
-are ready, not merely that installation commands were started. The subsequent Brev DeepStream clone
-fails if the hook cannot install the notebook. The script accepts optional environment overrides
-including `WORK_ROOT`, `DEEPSTREAM_REPO_URL`, `LAUNCHABLE_REPO_URL`, `DEEPSTREAM_IMAGE`,
-`SKIP_HOST_SETUP`, `SKIP_IMAGE_PULL`, and `SKIP_JUPYTER_SETUP`.
+Use the Brev path when you open the packaged launchable environment:
 
-The deployment assumes the DeepStream checkout is Jupyter's `ServerApp.root_dir`. Open
-`deploy/brev/deepstream_code_agent_launchable.ipynb` and run the cells top to bottom. All paths in
-this document are relative to that DeepStream root unless stated otherwise.
+1. Start the DeepStream Code Agent launchable from Brev.
+2. Open `deploy/brev/deepstream_code_agent_launchable.ipynb`.
+3. Run the numbered cells from top to bottom.
+4. In the Generate step, start with `video_infer_app` unless you need a specific scenario.
 
-Authenticate at the Authenticate step -- account sign-in, an API key, or a custom endpoint
-(held in memory, injected per agent call -- never written to disk). Advanced users can instead
-set `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`, or `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`
-environment variables and skip the Authenticate step.
+The launchable prepares the repository checkout, machine setup, and notebook runtime for you.
 
-**Where outputs go.** Generated code + run results land in **`deploy/brev/outputs/`** (the default
-`OUTPUT_ROOT`, right next to the notebook and below the supported Jupyter roots), so they show up in the
-**left-hand file browser** and survive a page refresh:
-- `deploy/brev/outputs/workspace/<app_dir>/` -- the generated code
-- `deploy/brev/outputs/workspace/agent_outputs/<prompt_id>/` -- the run artifacts (mp4 / openapi.json / ...)
+## Walkthrough
 
-To put outputs elsewhere, set `OUTPUT_ROOT` -- but keep it **under your Jupyter `root_dir`** if you
-want them in the file browser:
-```bash
-OUTPUT_ROOT="$PWD/ds_outputs" jupyter lab --ServerApp.root_dir="$PWD" ...
-```
+Run each notebook step in order and wait for its success message before continuing.
 
-Artifact links are derived from the running Jupyter server's actual DeepStream `root_dir`. Report
-results prefer the generated PDF and render its pages as images. Markdown is used only as a fallback
-when a PDF is absent or cannot be rasterized.
+| Step | What you do | Checkpoint |
+| --- | --- | --- |
+| 1. Configuration | Review paths, image names, container names, and runtime defaults. | The cell prints `Configuration set` and the active values. |
+| 2. Check environment and create workspace | Validate the GPU host and start the DeepStream container workspace. | The output reports `Environment ready`, the container name, and the mounted workspace. |
+| 3. Install agent and skills | Choose Claude Code or Codex, then install the CLI, DeepStream skills, and runtime dependencies. | The install step finishes without errors and the selected agent is available. |
+| 4. Authenticate | Provide account sign-in, API key, or custom endpoint credentials for the selected agent. | Authentication verification succeeds before you continue. |
+| 5. Generate | Choose a prompt, edit it if needed, and ask the agent to write the project artifacts. | The generated file preview appears and matches the selected scenario. |
+| 6. Run and view results | Run the generated project in the prepared runtime and view its artifacts. | The result viewer shows the expected MP4, JSON, service output, or report. |
+| 7. Cleanup | Optionally remove temporary lab containers. | Containers are removed while generated files and artifacts remain. |
 
-If you refresh the page (F5), live step outputs clear (your kernel + files are safe). Turn on
-**Settings -> Save Widget State Automatically**, or re-show a result with `lab.show_generated_code()`
-(Generate step) / `lab.show_results()` (Run step).
+Generate and Run are intentionally separate. Generate authors the project and previews the files;
+Run validates the project in the current runtime, applies bounded runtime fixes when needed, and
+renders the final evidence. Changing the selected prompt or editing its text invalidates the
+previous generation result, so Run cannot accidentally use artifacts from another scenario.
 
-## Update your own notebook
+Runtime fixes are made on a separate run copy. The original generated source remains available for
+review, while the run copy can be adjusted to satisfy the current container, services, model files,
+or headless output requirements.
 
-The `.ipynb` is **generated** -- edit the sources, not the notebook:
+## Choosing a scenario
 
-- **Steps / markdown / cell code** -> edit `scripts/build_notebook.py`, then regenerate:
-  ```bash
-  python3 deploy/brev/scripts/build_notebook.py
-  ```
-- **Engine logic** -> edit `scripts/ds_agent_lab.py` (or `ds_lab_config.py` for config/prompts).
-  The step widgets are built inline in `build_notebook.py`, not in a separate module.
-- **Add a prompt** -> drop a `.md` in `example_prompts/` and add a matching entry to
-  `PROMPT_CATALOG` in `scripts/ds_lab_config.py`.
+Start with a scenario that matches the time and evidence you need:
 
-Pick up changes in a running notebook:
+Not every example prompt produces a `pyservicemaker` application. Choose the prompt based on the
+artifact you want to demonstrate: an app, a native adapter, an analysis report, a model package, or
+a service/API workflow.
 
-- After editing a **`.py`** -> re-run the **Install step** (the first cell that loads `lab`; it
-  reloads the lab modules fresh -- no kernel restart needed). The Generate/Run steps reuse the
-  loaded module, so your agent / creds / selection survive.
-- After regenerating the **`.ipynb`** -> reload it in the browser (**File -> Reload Notebook from Disk**).
+| Scenario | Use it when you want | Typical result |
+| --- | --- | --- |
+| `video_infer_app` | The fastest end-to-end smoke test. | A compact DeepStream app and annotated MP4. |
+| `video_object_count` | A simple counting example on video input. | Object counts rendered with the stream. |
+| `ds_profiling_efficient_pipeline` | Automatically profile a multi-stream pipeline and explain its bottleneck. | A profiling report with bottleneck analysis, sustainable stream-count estimate, and hardware guidance. |
+| `msgconv_kafka` | Convert detection metadata to JSON and publish it directly to Kafka. | A runnable Kafka publisher and captured Kafka JSON messages. |
+| `msgbroker_nats` | Build a DeepStream `nvds_msgapi` message broker protocol adapter for NATS. | A native adapter shared library, JetStream/auth/TLS configuration, and local subscriber verification. |
+| `multi_stream_tracker` | Multiple live streams with tracking. | A tiled MP4 with persistent track IDs. |
+| `import_vision_model_detection_pipeline` | Full model onboarding and benchmarking. | Converted model files, configs, benchmark evidence, and a PDF report. |
+| `rtvi_vlm_core_app` | A VLM/video reasoning workflow. | VLM summaries, service output, and supporting artifacts. |
 
-## Regression tests
+More advanced scenarios may take longer because they pull models, build TensorRT engines, start
+services, or require agent-assisted run repair. Cold runs are slower than warm runs with cached
+images, packages, models, and engines.
 
-Run the Brev regression suite from the repository root:
+## Where results are stored
 
-```bash
-JUPYTER_PLATFORM_DIRS=1 PYTHONDONTWRITEBYTECODE=1 \
-  python3 -m unittest discover -s deploy/brev/tests -v
+By default, generated code and run artifacts are stored under:
+
+```text
+deploy/brev/outputs/workspace/
 ```
 
-The suite uses temporary directories rather than machine-specific paths. Its contracts cover:
+Generated projects are grouped by scenario. Agent transcripts and run artifacts are written
+under scenario-specific output directories, including files such as MP4 videos, JSON messages,
+service logs, OpenAPI specs, and PDF reports. Because the output directory is inside the Jupyter
+root, the results can be opened from the left-hand Jupyter file browser.
 
-- prompt selection/edit invalidation and agent-only selection preservation;
-- Generate/Run prerequisite enforcement, cross-control locking, failure recovery, and success state;
-- autonomous Generate behavior plus prompt-specific report requirements;
-- exact PDF/report ownership and profiling-report semantic validation;
-- PDF-first rendering with Markdown fallback;
-- Jupyter-root-relative artifact paths and URL escaping;
-- prompt catalog behavior for complete and partial checkouts;
-- generated-notebook parity with `build_notebook.py`;
-- the Brev post-setup, removed legacy bootstrap, and required VLM launcher.
+If the browser page is refreshed, live widget output may disappear even though the kernel and files
+remain. To preserve widget output, enable `Settings -> Save Widget State Automatically`. To show
+results again without re-running the agent, use `lab.show_generated_code()` after Generate or
+`lab.show_results()` after Run.
 
-`serve_vlm.sh` is not a general startup service. `ds_agent_lab.py` invokes it only for scenarios
-whose prompt metadata requires a local VLM endpoint, so it must remain beside the other Brev
-scripts even when most test cases do not use it.
+## Troubleshooting
 
-## Configurable env vars (all optional; sensible defaults)
+- If the environment check fails, verify Docker, the NVIDIA Container Toolkit, GPU visibility, and
+  access to the configured DeepStream image.
+- If authentication fails, rerun the Authenticate step and verify that the selected agent matches
+  the credential method you provided.
+- If Generate succeeds but Run fails, inspect the run output first. Run uses the selected scenario's
+  runtime contract and may need service startup, model files, or a bounded repair iteration.
+- If output files are missing, confirm that the selected scenario completed Run and that you are
+  looking under `deploy/brev/outputs/workspace/` from the Jupyter file browser.
+- If a first run is slow, check whether it is pulling images, downloading models, installing
+  packages, or building TensorRT engines. Later runs are usually faster once those assets are
+  cached.
 
-`OUTPUT_ROOT`, `DEEPSTREAM_IMAGE`, `AGENT_CONTAINER`, `SAMPLE_VIDEO`, `KAFKA_BOOTSTRAP`,
-`KAFKA_TOPIC`, `RTSP_BASE`, `VLM_ENDPOINT`, `VLM_MODEL`, `RTVI_SERVICE_PORT`, `DEMO_MAX_SECONDS`,
-`RUN_DEMO_TIMEOUT`, `IMPORT_VISION_TIMEOUT`. Credentials come from the Authenticate step (account
-sign-in, API key, or custom endpoint), or optionally from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`
-/ `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` env vars.
+## For maintainers
+
+The notebook is generated. Edit the sources, then regenerate the notebook instead of hand-editing
+notebook logic.
+
+```text
+<deepstream root>/
+├── deploy/brev/
+│   ├── deepstream_code_agent_launchable.ipynb  # user-facing generated notebook
+│   ├── README.md                               # this README
+│   ├── scripts/
+│   │   ├── build_notebook.py                    # notebook source of truth
+│   │   ├── ds_agent_lab.py                      # notebook runtime engine
+│   │   ├── ds_lab_config.py                     # prompt catalog and configuration
+│   │   ├── brev_post_setup.sh                   # machine setup
+│   │   └── serve_vlm.sh                         # VLM scenario launcher
+│   └── tests/                                   # regression tests
+├── example_prompts/                             # scenario descriptions
+└── skills/                                      # DeepStream agent skills
+```
+
+Prompt definitions live under `example_prompts/`. The prompt catalog and scenario metadata are
+maintained in `deploy/brev/scripts/ds_lab_config.py`. The notebook is generated from
+`deploy/brev/scripts/build_notebook.py`, and the runtime implementation lives in
+`deploy/brev/scripts/ds_agent_lab.py`.

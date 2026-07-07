@@ -33,13 +33,21 @@ class NotebookSourceTests(unittest.TestCase):
             self.assertEqual(cell.cell_type, "markdown" if kind == "md" else "code")
             self.assertEqual(cell.source, source.rstrip("\n"))
 
-    def test_config_docs_match_unconditional_assignment_behavior(self):
+    def test_config_docs_explain_edit_and_checkpoint(self):
         docs = build_notebook.MD_CONFIG
 
-        self.assertNotIn("uses `setdefault`", docs)
-        self.assertIn("overwrites existing environment variables", docs)
-        self.assertIn("re-run Step 3 (**Install**)", docs)
-        self.assertIn("`AGENT_TIMEOUT` takes effect on the next Generate", docs)
+        self.assertIn("only cell you normally edit", docs)
+        self.assertIn("`OUTPUT_ROOT`", docs)
+        self.assertIn("run **Install**", docs)
+        self.assertIn("`Configuration set`", docs)
+
+    def test_tutorial_explains_sequences_and_run_copy(self):
+        docs = build_notebook.MD_STEP3 + build_notebook.MD_STEP4
+
+        self.assertIn("two-stage workflow", docs)
+        self.assertIn("both prompts in order", docs)
+        self.assertIn("isolated", docs)
+        self.assertIn("applied only to that copy", docs)
 
     def test_prompt_callbacks_invalidate_and_lock_cross_step_controls(self):
         source = build_notebook.CODE_STEP3 + build_notebook.CODE_STEP4
@@ -116,7 +124,6 @@ class DeploymentScriptTests(unittest.TestCase):
     def test_jupyter_readiness_avoids_redundant_notebook_url_probe(self):
         source = (SCRIPTS / "brev_post_setup.sh").read_text()
 
-        self.assertIn("launchable notebook is missing under deploy/brev", source)
         self.assertIn("http://127.0.0.1:8888/api/status", source)
         self.assertNotIn("/api/contents/", source)
         self.assertNotIn("notebook_url", source)
@@ -132,34 +139,28 @@ class DeploymentScriptTests(unittest.TestCase):
         self.assertNotIn("systemctl restart jupyter", source)
         self.assertNotIn("systemctl is-active --quiet jupyter", source)
 
-    def test_post_setup_installs_one_time_deepstream_clone_hook(self):
+    def test_post_setup_discovers_existing_deepstream_checkout(self):
         source = (SCRIPTS / "brev_post_setup.sh").read_text()
 
-        self.assertIn("install_launchable_clone_hook()", source)
-        self.assertEqual(source.count("  install_launchable_clone_hook\n"), 1)
-        self.assertIn(
-            'local template_dir="$HOME/.local/share/ds-launchable/git-template"',
-            source,
-        )
-        self.assertIn('git config --global init.templateDir "$template_dir"', source)
-        self.assertIn("post-checkout", source)
-        self.assertIn("git remote get-url origin", source)
-        self.assertIn("unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX", source)
+        self.assertIn("find_deepstream_checkout()", source)
+        self.assertIn("install_launchable_overlay()", source)
+        self.assertIn("-iname 'deepstream'", source)
+        self.assertIn("remote get-url origin", source)
         self.assertIn("git clone --depth 1", source)
-        self.assertIn("launchable_repo_url", source)
-        self.assertIn("git config --global --unset-all init.templateDir", source)
-        self.assertNotIn('[[ -d "$TARGET_DIR/.git" ]]', source)
-        self.assertNotIn("install_launchable_overlay", source)
+        self.assertIn("LAUNCHABLE_REPO_URL", source)
+        self.assertIn("DEEPSTREAM_CHECKOUT_DIR", source)
+        self.assertNotIn("post-checkout", source)
+        self.assertNotIn("init.templateDir", source)
 
-    def test_clone_hook_overlays_notebook_after_checkout(self):
-        with tempfile.TemporaryDirectory(prefix="brev-clone-hook-") as tmp:
+    def test_existing_checkout_receives_overlay_case_insensitively(self):
+        with tempfile.TemporaryDirectory(prefix="brev-overlay-") as tmp:
             root = Path(tmp)
-            source = root / "deepstream-source"
             overlay = root / "ds_launchable"
             home = root / "home"
-            target = home / "deepstream"
-            source.mkdir()
             overlay.mkdir()
+            home.mkdir()
+            source = home / "DeepStream"
+            source.mkdir()
             (overlay / "deepstream_code_agent_launchable.ipynb").write_text("{}\n")
 
             for repo in (source, overlay):
@@ -177,11 +178,14 @@ class DeploymentScriptTests(unittest.TestCase):
                     ["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "init"],
                     check=True,
                 )
+            subprocess.run(
+                ["git", "-C", str(source), "remote", "add", "origin", str(source)],
+                check=True,
+            )
 
             env = {
                 **os.environ,
                 "HOME": str(home),
-                "WORK_ROOT": str(home),
                 "DEEPSTREAM_REPO_URL": str(source),
                 "LAUNCHABLE_REPO_URL": str(overlay),
                 "SKIP_HOST_SETUP": "1",
@@ -189,20 +193,12 @@ class DeploymentScriptTests(unittest.TestCase):
                 "SKIP_JUPYTER_SETUP": "1",
             }
             subprocess.run(["bash", str(SCRIPTS / "brev_post_setup.sh")], env=env, check=True)
-            subprocess.run(["git", "clone", "-q", str(source), str(target)], env=env, check=True)
 
             self.assertTrue(
-                (target / "deploy/brev/deepstream_code_agent_launchable.ipynb").is_file()
+                (home / "DeepStream/deploy/brev/deepstream_code_agent_launchable.ipynb").is_file()
             )
-            self.assertFalse((target / ".git/hooks/post-checkout").exists())
             self.assertFalse((home / ".local/share/ds-launchable/git-template").exists())
-            self.assertNotEqual(
-                subprocess.run(
-                    ["git", "config", "--global", "--get", "init.templateDir"],
-                    env=env,
-                ).returncode,
-                0,
-            )
+            self.assertFalse((home / "DeepStream/deploy/brev/.git").exists())
 
     def test_vlm_launcher_is_present_and_referenced_by_runtime(self):
         launcher = SCRIPTS / "serve_vlm.sh"
