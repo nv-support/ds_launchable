@@ -39,7 +39,7 @@ Generate-stage virtual environment is not treated as portable application conten
     deepstream_code_agent_launchable.ipynb   # the notebook (GENERATED -- do not hand-edit for logic)
     README.md
     scripts/
-      brev_post_setup.sh  # fresh-Brev host, launchable overlay, image, and readiness setup
+      brev_post_setup.sh  # fresh-Brev host, clone hook, image, and readiness setup
       build_notebook.py    # SOURCE OF TRUTH for the .ipynb (run it to regenerate)
       ds_lab_config.py     # config + PROMPT_CATALOG (paths, images, endpoints, prompts) -- data only
       ds_agent_lab.py      # the engine the notebook imports as `lab` (docker/agent/generate/run/results + ensure_ipywidgets)
@@ -57,26 +57,29 @@ named skills into the agent. `REPO_ROOT` is derived from the module's own locati
 
 ## Brev deployment
 
-Configure the Brev launchable repository as `https://github.com/NVIDIA/DeepStream.git`, so Brev
-clones it to `$HOME/deepstream` before post-setup starts. Then use `scripts/brev_post_setup.sh` as
-the post-setup script. It deliberately starts with `#!/bin/bash`, uses the Brev-managed `uv` and
-Python environment, and does not replace that environment. The script requires the existing
-`$HOME/deepstream` Git checkout, clones only `ds_launchable`, and overlays its contents under
-`$HOME/deepstream/deploy/brev`. It completes only after all of the following readiness gates pass:
+Configure the Brev launchable repository as `https://github.com/NVIDIA/DeepStream.git`, then use
+`scripts/brev_post_setup.sh` as the post-setup script. Brev runs this script before its repository
+clone, so the script installs a one-time Git `post-checkout` hook under the current user's HOME.
+When Brev finishes cloning DeepStream, Git runs the hook, which clones `ds_launchable` and overlays
+it under `$HOME/deepstream/deploy/brev`. The hook removes itself and its HOME template after the
+overlay succeeds. The script deliberately starts with `#!/bin/bash`, uses the Brev-managed `uv`
+and Python environment, and does not replace that environment. It completes after the host and
+hook readiness gates pass:
 
 - Docker and the NVIDIA Container Toolkit are installed/configured and the daemon is reachable.
 - The Brev Python environment contains `pip`, `ipywidgets`, and the Jupyter widget extension; a
   kernel-level widget MIME smoke test succeeds.
-- The DeepStream checkout contains the notebook, prompts, and skills in their expected locations.
+- The HOME Git clone template is armed; the DeepStream clone hook validates the notebook after checkout.
 - `nvcr.io/nvidia/deepstream:9.0-triton-multiarch` is fully pulled, has a repository digest, and
   passes an NVIDIA GPU container smoke test.
 - `poppler-utils` is installed so PDF reports can be rendered as notebook images.
-- `jupyter.service`, its HTTP API, and the notebook contents endpoint are all ready.
+- Jupyter's HTTP API is responding.
 
-The script is intentionally fail-fast: a successful Brev post-setup means the environment is ready,
-not merely that installation commands were started. It accepts optional environment overrides
-documented at the top of the script, including `WORK_ROOT`, `LAUNCHABLE_REPO_URL`,
-`DEEPSTREAM_IMAGE`, `SKIP_HOST_SETUP`, `SKIP_IMAGE_PULL`, and `SKIP_JUPYTER_SETUP`.
+The script is intentionally fail-fast: a successful Brev post-setup means the host and clone hook
+are ready, not merely that installation commands were started. The subsequent Brev DeepStream clone
+fails if the hook cannot install the notebook. The script accepts optional environment overrides
+including `WORK_ROOT`, `DEEPSTREAM_REPO_URL`, `LAUNCHABLE_REPO_URL`, `DEEPSTREAM_IMAGE`,
+`SKIP_HOST_SETUP`, `SKIP_IMAGE_PULL`, and `SKIP_JUPYTER_SETUP`.
 
 The deployment assumes the DeepStream checkout is Jupyter's `ServerApp.root_dir`. Open
 `deploy/brev/deepstream_code_agent_launchable.ipynb` and run the cells top to bottom. All paths in

@@ -1,16 +1,14 @@
 #!/bin/bash
 set -Eeuo pipefail
 
-POST_SETUP_VERSION=2026-07-07.1
+POST_SETUP_VERSION=2026-07-07.2
 WORK_ROOT=${WORK_ROOT:-"$HOME"}
-LAUNCHABLE_REPO_URL=${LAUNCHABLE_REPO_URL:-https://github.com/nv-support/ds_launchable.git}
 DEEPSTREAM_IMAGE=${DEEPSTREAM_IMAGE:-nvcr.io/nvidia/deepstream:9.0-triton-multiarch}
 SKIP_HOST_SETUP=${SKIP_HOST_SETUP:-0}
 SKIP_IMAGE_PULL=${SKIP_IMAGE_PULL:-0}
 SKIP_JUPYTER_SETUP=${SKIP_JUPYTER_SETUP:-0}
 
 TARGET_DIR="$WORK_ROOT/deepstream"
-TEMP_DIR=""
 
 section() {
   printf '\n=== %s ===\n' "$1"
@@ -24,13 +22,6 @@ die() {
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required but was not found"
 }
-
-cleanup() {
-  if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
-    rm -rf "$TEMP_DIR"
-  fi
-}
-trap cleanup EXIT
 
 install_host_prerequisites() {
   if [[ "$SKIP_HOST_SETUP" == "1" ]]; then
@@ -181,26 +172,63 @@ select_docker_command() {
   fi
 }
 
-install_launchable_overlay() {
-  section "Install launchable overlay"
+install_launchable_clone_hook() {
+  section "Install launchable clone hook"
   require_command git
   require_command tar
 
-  [[ -d "$TARGET_DIR/.git" ]] \
-    || die "Brev-managed DeepStream checkout not found: $TARGET_DIR"
+  local deepstream_repo_url=${DEEPSTREAM_REPO_URL:-https://github.com/NVIDIA/DeepStream.git}
+  local launchable_repo_url=${LAUNCHABLE_REPO_URL:-https://github.com/nv-support/ds_launchable.git}
+  local template_dir="$HOME/.local/share/ds-launchable/git-template"
+  local hook_path="$template_dir/hooks/post-checkout"
 
-  TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ds-launchable.XXXXXX")
-  git clone --depth 1 "$LAUNCHABLE_REPO_URL" "$TEMP_DIR/ds_launchable"
+  mkdir -p "$template_dir/hooks"
+  cat >"$hook_path" <<HOOK
+#!/bin/bash
+set -Eeuo pipefail
 
-  mkdir -p "$TARGET_DIR/deploy/brev"
-  git -C "$TEMP_DIR/ds_launchable" archive --format=tar HEAD \
-    | tar -xf - -C "$TARGET_DIR/deploy/brev"
+expected_remote=$(printf '%q' "$deepstream_repo_url")
+launchable_repo_url=$(printf '%q' "$launchable_repo_url")
+template_dir=$(printf '%q' "$template_dir")
 
-  [[ ! -e "$TARGET_DIR/deploy/brev/.git" ]] \
-    || die "unexpected nested Git metadata under deploy/brev"
+origin=\$(git remote get-url origin 2>/dev/null || true)
+hook_path=\$(git rev-parse --git-path hooks/post-checkout)
+if [[ "\${origin%.git}" != "\${expected_remote%.git}" ]]; then
+  rm -f "\$hook_path"
+  exit 0
+fi
 
-  [[ -f "$TARGET_DIR/deploy/brev/deepstream_code_agent_launchable.ipynb" ]] \
-    || die "launchable notebook is missing under $TARGET_DIR/deploy/brev"
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
+
+configured_template=\$(git config --global --get init.templateDir || true)
+if [[ "\$configured_template" == "\$template_dir" ]]; then
+  git config --global --unset-all init.templateDir
+fi
+rm -rf "\$template_dir"
+
+temp_dir=\$(mktemp -d "\${TMPDIR:-/tmp}/ds-launchable.XXXXXX")
+cleanup() { rm -rf "\$temp_dir"; }
+trap cleanup EXIT
+
+printf '\n=== Install launchable overlay after DeepStream clone ===\n'
+git clone --depth 1 "\$launchable_repo_url" "\$temp_dir/ds_launchable"
+mkdir -p deploy/brev
+git -C "\$temp_dir/ds_launchable" archive --format=tar HEAD \
+  | tar -xf - -C deploy/brev
+
+[[ ! -e deploy/brev/.git ]] \
+  || { printf 'ERROR: unexpected nested Git metadata under deploy/brev\n' >&2; exit 1; }
+[[ -f deploy/brev/deepstream_code_agent_launchable.ipynb ]] \
+  || { printf 'ERROR: launchable notebook is missing under deploy/brev\n' >&2; exit 1; }
+
+rm -f "\$hook_path"
+printf 'Launchable overlay installed under %s/deploy/brev\n' "\$PWD"
+HOOK
+
+  chmod 0755 "$hook_path"
+  git config --global init.templateDir "$template_dir"
+  printf 'One-time Git template installed: %s\n' "$template_dir"
+  printf 'It will overlay ds_launchable when Brev clones: %s\n' "$deepstream_repo_url"
 }
 
 pull_and_verify_image() {
@@ -231,13 +259,13 @@ pull_and_verify_image() {
 main() {
   printf 'Post-setup version: %s\n' "$POST_SETUP_VERSION"
   install_host_prerequisites
-  install_launchable_overlay
+  install_launchable_clone_hook
   pull_and_verify_image
   prepare_jupyter_environment
 
   section "Brev post-setup complete"
-  printf 'DeepStream repository: %s\n' "$TARGET_DIR"
-  printf 'Launchable notebook:    %s\n' \
+  printf 'Expected DeepStream repository: %s\n' "$TARGET_DIR"
+  printf 'Launchable notebook after clone: %s\n' \
     "$TARGET_DIR/deploy/brev/deepstream_code_agent_launchable.ipynb"
 }
 

@@ -116,10 +116,7 @@ class DeploymentScriptTests(unittest.TestCase):
     def test_jupyter_readiness_avoids_redundant_notebook_url_probe(self):
         source = (SCRIPTS / "brev_post_setup.sh").read_text()
 
-        self.assertIn(
-            '[[ -f "$TARGET_DIR/deploy/brev/deepstream_code_agent_launchable.ipynb" ]]',
-            source,
-        )
+        self.assertIn("launchable notebook is missing under deploy/brev", source)
         self.assertIn("http://127.0.0.1:8888/api/status", source)
         self.assertNotIn("/api/contents/", source)
         self.assertNotIn("notebook_url", source)
@@ -135,18 +132,77 @@ class DeploymentScriptTests(unittest.TestCase):
         self.assertNotIn("systemctl restart jupyter", source)
         self.assertNotIn("systemctl is-active --quiet jupyter", source)
 
-    def test_post_setup_overlays_brev_managed_deepstream_checkout(self):
+    def test_post_setup_installs_one_time_deepstream_clone_hook(self):
         source = (SCRIPTS / "brev_post_setup.sh").read_text()
 
-        self.assertIn('[[ -d "$TARGET_DIR/.git" ]]', source)
-        self.assertIn("Brev-managed DeepStream checkout not found", source)
+        self.assertIn("install_launchable_clone_hook()", source)
+        self.assertEqual(source.count("  install_launchable_clone_hook\n"), 1)
         self.assertIn(
-            'git clone --depth 1 "$LAUNCHABLE_REPO_URL" "$TEMP_DIR/ds_launchable"',
+            'local template_dir="$HOME/.local/share/ds-launchable/git-template"',
             source,
         )
-        self.assertNotIn("DEEPSTREAM_REPO_URL", source)
-        self.assertNotIn("INSTALL_LAUNCHABLE_OVERLAY", source)
-        self.assertNotIn("target already exists; refusing to modify it", source)
+        self.assertIn('git config --global init.templateDir "$template_dir"', source)
+        self.assertIn("post-checkout", source)
+        self.assertIn("git remote get-url origin", source)
+        self.assertIn("unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX", source)
+        self.assertIn("git clone --depth 1", source)
+        self.assertIn("launchable_repo_url", source)
+        self.assertIn("git config --global --unset-all init.templateDir", source)
+        self.assertNotIn('[[ -d "$TARGET_DIR/.git" ]]', source)
+        self.assertNotIn("install_launchable_overlay", source)
+
+    def test_clone_hook_overlays_notebook_after_checkout(self):
+        with tempfile.TemporaryDirectory(prefix="brev-clone-hook-") as tmp:
+            root = Path(tmp)
+            source = root / "deepstream-source"
+            overlay = root / "ds_launchable"
+            home = root / "home"
+            target = home / "deepstream"
+            source.mkdir()
+            overlay.mkdir()
+            (overlay / "deepstream_code_agent_launchable.ipynb").write_text("{}\n")
+
+            for repo in (source, overlay):
+                subprocess.run(["git", "init", "-q", str(repo)], check=True)
+                subprocess.run(
+                    ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(repo), "config", "user.name", "Test"],
+                    check=True,
+                )
+                subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+                subprocess.run(
+                    ["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "init"],
+                    check=True,
+                )
+
+            env = {
+                **os.environ,
+                "HOME": str(home),
+                "WORK_ROOT": str(home),
+                "DEEPSTREAM_REPO_URL": str(source),
+                "LAUNCHABLE_REPO_URL": str(overlay),
+                "SKIP_HOST_SETUP": "1",
+                "SKIP_IMAGE_PULL": "1",
+                "SKIP_JUPYTER_SETUP": "1",
+            }
+            subprocess.run(["bash", str(SCRIPTS / "brev_post_setup.sh")], env=env, check=True)
+            subprocess.run(["git", "clone", "-q", str(source), str(target)], env=env, check=True)
+
+            self.assertTrue(
+                (target / "deploy/brev/deepstream_code_agent_launchable.ipynb").is_file()
+            )
+            self.assertFalse((target / ".git/hooks/post-checkout").exists())
+            self.assertFalse((home / ".local/share/ds-launchable/git-template").exists())
+            self.assertNotEqual(
+                subprocess.run(
+                    ["git", "config", "--global", "--get", "init.templateDir"],
+                    env=env,
+                ).returncode,
+                0,
+            )
 
     def test_vlm_launcher_is_present_and_referenced_by_runtime(self):
         launcher = SCRIPTS / "serve_vlm.sh"
